@@ -19,8 +19,9 @@ fi
 # Assign the arguments to variables for clarity
 CONTAINER_NAME="$1"
 IMAGE_NAME="$2"
-PROJECT_DIR="/path/to/your/superodom"
-DATASET_DIR="/path/to/your/dataset"
+PROJECT_DIR="/home/gzhou/personal_projects/ros2_ws/src"
+DATASET_DIR="/home/gzhou/workspace/Datasets"
+GIT_DIR="/home/gzhou/git"
 
 # Launch the nvidia-docker container with the provided image name and tag
 docker run --privileged -it \
@@ -29,11 +30,11 @@ docker run --privileged -it \
            -e NVIDIA_VISIBLE_DEVICES=all \
            --volume="$PROJECT_DIR:/root/ros2_ws/src" \
            --volume="$DATASET_DIR:/root/data" \
+           --volume="$GIT_DIR:$GIT_DIR" \
            --volume=/tmp/.X11-unix:/tmp/.X11-unix:rw \
            --net=host \
            --ipc=host \
            --shm-size=4gb \
            --name="$CONTAINER_NAME" \
            --env="DISPLAY=$DISPLAY" \
-           --rm \
            "$IMAGE_NAME" /bin/bash
