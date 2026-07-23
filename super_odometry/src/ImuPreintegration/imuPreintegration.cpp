@@ -574,70 +574,22 @@ namespace super_odometry {
         last_frame = cur_frame;
         last_processed_lidar_time = lidarOdomTime;
     }
-    // Preserves the original conversion behavior. It applies the initial
-    // gravity/lidar rotation to gyro and acceleration, adds a lever-arm
-    // correction, and post-multiplies orientation by the same rotation.
-    // WARNING: R_gravity_lidar_initial maps lidar vectors into the initial
-    // gravity frame, while the inputs below are raw IMU-frame measurements.
-    // The frames are therefore inconsistent for non-identity extrinsics.
+    // Keep measurements in the physical IMU frame expected by GTSAM. Startup
+    // leveling belongs in the world pose; lidar extrinsics are applied only at
+    // lidar measurement and publishing boundaries.
     sensor_msgs::msg::Imu imuPreintegration::imuConverter(const sensor_msgs::msg::Imu &imu_in) {
         sensor_msgs::msg::Imu imu_out = imu_in;
-        // This rotation maps data in lidar frame to the initial gravity frame at the same origin.
-        Eigen::Matrix3d R_gravity_lidar_initial =
-            imu_Init->R_gravity_lidar_initial;
-
-        // Retained for exact compatibility with the original implementation;
-        // this value is calculated but not otherwise used.
-        Eigen::Vector3d rpy_gravity_lidar_initial =
-            imu_Init->rotationMatrixToRPY(R_gravity_lidar_initial);
-
-        Eigen::Vector3d gyr_gravity_lidar(
-            imu_in.angular_velocity.x, imu_in.angular_velocity.y,
-            imu_in.angular_velocity.z);
-        gyr_gravity_lidar =
-            R_gravity_lidar_initial * gyr_gravity_lidar;
-        imu_out.angular_velocity.x = gyr_gravity_lidar.x();
-        imu_out.angular_velocity.y = gyr_gravity_lidar.y();
-        imu_out.angular_velocity.z = gyr_gravity_lidar.z();
-
-        Eigen::Vector3d acc_gravity_lidar(
-            imu_in.linear_acceleration.x, imu_in.linear_acceleration.y,
-            imu_in.linear_acceleration.z);
-        acc_gravity_lidar =
-            R_gravity_lidar_initial * acc_gravity_lidar;
-
-        // Original lever-arm correction. WARNING:
-        // - 200 hardcodes a 200 Hz sample rate.
-        // - gyr_gravity_lidar_prev is not initialized before the first call.
-        // - t_imu_lidar is expressed in IMU axes, unlike the rotated vectors.
-        acc_gravity_lidar =
-            acc_gravity_lidar
-            + ((gyr_gravity_lidar - gyr_gravity_lidar_prev) * 200)
-                  .cross(-t_imu_lidar)
-            + gyr_gravity_lidar.cross(
-                  gyr_gravity_lidar.cross(-t_imu_lidar));
-        imu_out.linear_acceleration.x = acc_gravity_lidar.x();
-        imu_out.linear_acceleration.y = acc_gravity_lidar.y();
-        imu_out.linear_acceleration.z = acc_gravity_lidar.z();
 
         Eigen::Quaterniond q_world_imu(
             imu_in.orientation.w, imu_in.orientation.x,
             imu_in.orientation.y, imu_in.orientation.z);
-        // WARNING: normalizing a zero/invalid driver quaternion can produce NaN.
-        q_world_imu.normalize();
-
-        Eigen::Quaterniond q_gravity_lidar_initial(
-            R_gravity_lidar_initial);
-        Eigen::Quaterniond q_world_lidar_gravity_aligned =
-            q_world_imu * q_gravity_lidar_initial;
-        q_world_lidar_gravity_aligned.normalize();
-
-        imu_out.orientation.x = q_world_lidar_gravity_aligned.x();
-        imu_out.orientation.y = q_world_lidar_gravity_aligned.y();
-        imu_out.orientation.z = q_world_lidar_gravity_aligned.z();
-        imu_out.orientation.w = q_world_lidar_gravity_aligned.w();
-
-        gyr_gravity_lidar_prev = gyr_gravity_lidar;
+        if (q_world_imu.squaredNorm() > 1e-12) {
+            q_world_imu.normalize();
+            imu_out.orientation.x = q_world_imu.x();
+            imu_out.orientation.y = q_world_imu.y();
+            imu_out.orientation.z = q_world_imu.z();
+            imu_out.orientation.w = q_world_imu.w();
+        }
 
         return imu_out;
     }
@@ -649,12 +601,8 @@ namespace super_odometry {
    void imuPreintegration::imuHandler(const sensor_msgs::msg::Imu::SharedPtr imu_raw) {
     std::lock_guard<std::mutex> lock(mBuf);
     
-    // 1. Apply the original IMU conversion described above.
+    // 1. Preserve the physical IMU frame (orientation normalization only).
     sensor_msgs::msg::Imu thisImu = imuConverter(*imu_raw);
-    // WARNING: this is not a reliable validation check: a valid conversion can
-    // leave the x component unchanged and trigger this assertion.
-    assert(imu_raw->linear_acceleration.x !=
-           thisImu.linear_acceleration.x);
 
     // 2. During the first ~1 s, only collect data for the one-time IMU
     //    initialization (bias/gravity/leveling); nothing else can run yet.
@@ -662,7 +610,7 @@ namespace super_odometry {
         return;
     }
 
-    // 3. Push the converted sample into both queues (for optimization and
+    // 3. Push the physical-frame sample into both queues (for optimization and
     //    for high-rate propagation).
     processTiming(thisImu);
 
@@ -691,17 +639,21 @@ namespace super_odometry {
         initializeImu(imu_raw);
     }
 
+    if (!imu_init_success) {
+        return false;
+    }
+
     if (config_.sensor == SensorType::LIVOX) {
         correctLivoxGravity(thisImu);
     }
     
-    return imu_init_success; 
+    return true;
 
    }
 
    // Collects raw IMU samples into imuBuf; once 1 s of data has accumulated,
-   // Imu::imuInit() estimates the gyro/accel biases, gravity direction and the
-   // initial leveling rotation used by the lidar front end.
+   // Imu::imuInit() estimates gyro/accel statistics, gravity direction, and
+   // initial tilt diagnostics without changing the estimator measurement frame.
    // The robot should be stationary during this window.
    void imuPreintegration::initializeImu(const sensor_msgs::msg::Imu::SharedPtr& imu_raw) {
     Imu::Ptr imudata = std::make_shared<Imu>();
@@ -746,7 +698,7 @@ void imuPreintegration::correctLivoxGravity(sensor_msgs::msg::Imu& thisImu) {
 }
 
 
-// Updates the last-IMU-timestamp bookkeeping and appends the converted sample
+// Updates the last-IMU-timestamp bookkeeping and appends the physical-frame sample
 // to both queues: imuQueOpt (consumed by the optimizer between lidar poses)
 // and imuQueImu (used for high-rate propagation past the last lidar pose).
 void imuPreintegration::processTiming(const sensor_msgs::msg::Imu& thisImu) {
@@ -883,9 +835,7 @@ const sensor_msgs::msg::Imu &thisImu, const gtsam::NavState &currentState){
         T_world_lidar.rotation().toQuaternion().x(),
         T_world_lidar.rotation().toQuaternion().y(),
         T_world_lidar.rotation().toQuaternion().z());
-    // WARNING: normalized() returns a new quaternion; because the return value
-    // is discarded, this original call does not normalize q_world_lidar.
-    q_world_lidar.normalized();
+    q_world_lidar.normalize();
 
     odometry.pose.pose.position.x = T_world_lidar.translation().x();
     odometry.pose.pose.position.y = T_world_lidar.translation().y();
@@ -898,13 +848,14 @@ const sensor_msgs::msg::Imu &thisImu, const gtsam::NavState &currentState){
     odometry.twist.twist.linear.x = velocity_imu_current.x();
     odometry.twist.twist.linear.y = velocity_imu_current.y();;
     odometry.twist.twist.linear.z = velocity_imu_current.z();;
-    // Angular rate = raw gyro corrected by the estimated gyro bias.
+    // GTSAM's bias convention is measurement = truth + bias, so recover the
+    // physical IMU angular rate by subtracting the estimated gyro bias.
     odometry.twist.twist.angular.x =
-            thisImu.angular_velocity.x + prevBiasOdom.gyroscope().x();
+            thisImu.angular_velocity.x - prevBiasOdom.gyroscope().x();
     odometry.twist.twist.angular.y =
-            thisImu.angular_velocity.y + prevBiasOdom.gyroscope().y();
+            thisImu.angular_velocity.y - prevBiasOdom.gyroscope().y();
     odometry.twist.twist.angular.z =
-            thisImu.angular_velocity.z + prevBiasOdom.gyroscope().z();
+            thisImu.angular_velocity.z - prevBiasOdom.gyroscope().z();
 
     // The covariance array is repurposed as a side channel:
     // [0] = IMU health state (IMU_STATE enum), [1..3] = accel bias,

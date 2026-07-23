@@ -28,8 +28,8 @@
 //
 // Data flow:
 //
-//   IMU topic ──> imuHandler ──> imuConverter (original gravity/lidar
-//                 rotation and lever-arm correction) ──> two queues:
+//   IMU topic ──> imuHandler ──> imuConverter (same physical IMU frame)
+//                 ──> two queues:
 //                   - imuQueOpt: consumed by the optimizer thread of work
 //                   - imuQueImu: used to propagate high-rate odometry
 //                 ──> predict + publish odometry at IMU rate
@@ -210,21 +210,16 @@ namespace super_odometry {
 
 
         /**
-         * @brief Applies the package's original IMU conversion behavior.
+         * @brief Prepares a raw message without changing its physical frame.
          *
-         * Gyro and acceleration are multiplied by R_gravity_lidar_initial,
-         * acceleration receives the original finite-difference lever-arm
-         * correction, and orientation is post-multiplied by the quaternion
-         * formed from R_gravity_lidar_initial.
+         * GTSAM state X(k) is T_world_imu, and its preintegrators expect
+         * acceleration, angular velocity, and bias in the physical IMU frame at
+         * the IMU origin. Consequently this function does not apply lidar
+         * extrinsics, startup leveling, or lever-arm corrections. It only
+         * normalizes a valid optional orientation quaternion.
          *
-         * This behavior is retained for compatibility, but its frame conventions
-         * are questionable: raw measurements are in the IMU frame,
-         * R_gravity_lidar_initial maps lidar into the initial gravity frame, and
-         * t_imu_lidar remains expressed in IMU axes. The derivative also assumes
-         * exactly 200 Hz and uses an uninitialized previous gyro on the first call.
-         *
-         * @param imu_in Raw IMU message from the driver.
-         * @return The message after the original rotation and lever-arm operations.
+         * @param imu_in Raw IMU message expressed in the physical IMU frame.
+         * @return A same-frame copy with a normalized valid orientation.
          */
         sensor_msgs::msg::Imu
         imuConverter(const sensor_msgs::msg::Imu &imu_in);
@@ -302,8 +297,8 @@ namespace super_odometry {
     public:
         // ---- Buffers --------------------------------------------------------
         MapRingBuffer<Imu::Ptr> imuBuf;             // raw IMU kept ~1 s for one-time initialization
-        std::deque<sensor_msgs::msg::Imu> imuQueOpt;// converted IMU data awaiting graph integration
-        std::deque<sensor_msgs::msg::Imu> imuQueImu;// converted IMU data newer than the last lidar pose
+        std::deque<sensor_msgs::msg::Imu> imuQueOpt;// physical IMU data awaiting graph integration
+        std::deque<sensor_msgs::msg::Imu> imuQueImu;// physical IMU data newer than the last lidar pose
         MapRingBuffer<nav_msgs::msg::Odometry::SharedPtr> lidarOdomBuf;
         std::mutex mBuf;                            // guards both callbacks (they share the queues)
         Imu::Ptr imu_Init = std::make_shared<Imu>();// results of IMU init: biases, gravity, leveling rotation
@@ -317,7 +312,6 @@ namespace super_odometry {
 
        
         Eigen::Quaterniond q_world_imu_first;
-        Eigen::Vector3d gyr_gravity_lidar_prev;
 
         double first_imu_time_stamp;
         double last_processed_lidar_time = -1;
