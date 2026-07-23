@@ -1,4 +1,23 @@
 #pragma once
+// ============================================================================
+// OVERVIEW
+// ============================================================================
+// Legacy helper header inherited from LIO-SAM, included by the
+// imuPreintegration node (via "utility.h"). It bundles:
+//
+//   - A large set of ROS2 / PCL / tf2 / OpenCV includes that the rest of the
+//     node relies on.
+//   - ParamServer: a class that declares and reads all "super_loam/*" ROS
+//     parameters (topics, IMU noise values, sensor extrinsics, LOAM feature
+//     and keyframe thresholds) into public member variables. Most of these
+//     parameters are unused by SuperOdom itself; the imuPreintegration node
+//     reads its own parameters instead (see config/parameter.h).
+//   - Free helper functions for publishing point clouds and unpacking IMU
+//     messages into plain scalars.
+//
+// Note: this is a different file from super_odometry/utils/utility.h, which
+// holds quaternion math helpers.
+// ============================================================================
 #ifndef _UTILITY_LIDAR_ODOMETRY_H_
 #define _UTILITY_LIDAR_ODOMETRY_H_
 
@@ -56,12 +75,18 @@ using namespace std;
 
 typedef pcl::PointXYZI PointType;
 
+/// Loads every "super_loam/*" ROS parameter into a public member on
+/// construction, so nodes can inherit from it (LIO-SAM style) and access
+/// configuration directly. The member groups below mirror the parameter
+/// file sections. Note the constructor dereferences 'node', so it must be
+/// set before a ParamServer is constructed.
 class ParamServer {
 public:
   rclcpp::Node::SharedPtr node;
 
   std::string robot_id;
 
+  // Input/output topic names.
   string pointCloudTopic;
   string imuTopic;
   string odomTopic;
@@ -77,17 +102,19 @@ public:
   bool savePCD;
   string savePCDDirectory;
 
-  // Velodyne Sensor Configuration: Velodyne
+  // Velodyne Sensor Configuration: number of scan rings and points per ring.
   int N_SCAN;
   int Horizon_SCAN;
 
-  // IMU
+  // IMU noise densities, bias random walks and gravity magnitude.
   float imuAccNoise;
   float imuGyrNoise;
   float imuAccBiasN;
   float imuGyrBiasN;
   float imuGravity;
 
+  // Sensor extrinsics as flat row-major vectors read from the parameter
+  // file (IMU->camera and camera->laser rotation/translation)...
   vector<double> extRimu_camV;
   vector<double> extTranimu_camV;
   vector<double> extRcam_laserV;
@@ -97,6 +124,7 @@ public:
   vector<double> extRPYV;
   vector<double> extTransV;
 
+  // ...and the same extrinsics repacked into Eigen matrices/vectors.
   Eigen::Matrix3d extRimu_cam;
   Eigen::Vector3d extTranimu_cam;
   Eigen::Matrix3d extRcam_laser;
@@ -107,7 +135,7 @@ public:
   Eigen::Vector3d extTrans;
   Eigen::Quaterniond extQRPY;
 
-  // LOAM
+  // LOAM feature extraction thresholds (edge/surface curvature).
   float edgeThreshold;
   float surfThreshold;
   int edgeFeatureMinValidNum;
@@ -144,6 +172,8 @@ public:
   float globalMapVisualizationPoseDensity;
   float globalMapVisualizationLeafSize;
 
+  /// Declares all parameters with their defaults, then immediately reads
+  /// them back into the members above.
   ParamServer() {
     node->declare_parameter("smalldrone_id", "small_drone");
 
@@ -412,35 +442,42 @@ public:
     usleep(100);
   }
 
+  /// In the original LIO-SAM this rotated the IMU measurement into the lidar
+  /// frame using the extRot/extQRPY extrinsics. Here the rotation has been
+  /// stripped out, so the function just copies the message through unchanged;
+  /// the real frame conversion is done by imuPreintegration::imuConverter().
   sensor_msgs::msg::Imu imuConverter(const sensor_msgs::msg::Imu &imu_in) {
     sensor_msgs::msg::Imu imu_out = imu_in;
-    // rotate acceleration
+    // acceleration (copied as-is, no extrinsic rotation applied)
     Eigen::Vector3d acc(imu_in.linear_acceleration.x,
                         imu_in.linear_acceleration.y,
                         imu_in.linear_acceleration.z);
     imu_out.linear_acceleration.x = acc.x();
     imu_out.linear_acceleration.y = acc.y();
     imu_out.linear_acceleration.z = acc.z();
-    // rotate gyroscope
+    // gyroscope (copied as-is)
     Eigen::Vector3d gyr(imu_in.angular_velocity.x, imu_in.angular_velocity.y,
                         imu_in.angular_velocity.z);
 
     imu_out.angular_velocity.x = gyr.x();
     imu_out.angular_velocity.y = gyr.y();
     imu_out.angular_velocity.z = gyr.z();
-    // rotate roll pitch yaw
-    Eigen::Quaterniond q(imu_in.orientation.w, imu_in.orientation.x,
-                         imu_in.orientation.y, imu_in.orientation.z);
+    // orientation (copied as-is)
+    Eigen::Quaterniond q_world_imu(
+        imu_in.orientation.w, imu_in.orientation.x,
+        imu_in.orientation.y, imu_in.orientation.z);
 
-    imu_out.orientation.x = q.x();
-    imu_out.orientation.y = q.y();
-    imu_out.orientation.z = q.z();
-    imu_out.orientation.w = q.w();
+    imu_out.orientation.x = q_world_imu.x();
+    imu_out.orientation.y = q_world_imu.y();
+    imu_out.orientation.z = q_world_imu.z();
+    imu_out.orientation.w = q_world_imu.w();
 
     return imu_out;
   }
 };
 
+/// Converts a PCL cloud to a ROS PointCloud2 message with the given stamp
+/// and frame, publishes it if anyone is subscribed, and returns the message.
 sensor_msgs::msg::PointCloud2
 publishCloud(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr thisPub, pcl::PointCloud<PointType>::Ptr thisCloud,
                                 rclcpp::Time thisStamp, std::string thisFrame)
@@ -455,6 +492,7 @@ publishCloud(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr thisPub
 }
 
 
+/// Copies the angular velocity (rad/s) out of an IMU message into three scalars.
 template <typename T>
 void imuAngular2rosAngular(sensor_msgs::msg::Imu::SharedPtr thisImuMsg, T *angular_x,
                            T *angular_y, T *angular_z) {
@@ -463,6 +501,7 @@ void imuAngular2rosAngular(sensor_msgs::msg::Imu::SharedPtr thisImuMsg, T *angul
   *angular_z = thisImuMsg->angular_velocity.z;
 }
 
+/// Copies the linear acceleration (m/s^2) out of an IMU message into three scalars.
 template <typename T>
 void imuAccel2rosAccel(sensor_msgs::msg::Imu::SharedPtr thisImuMsg, T *acc_x, T *acc_y,
                        T *acc_z) {
@@ -471,6 +510,7 @@ void imuAccel2rosAccel(sensor_msgs::msg::Imu::SharedPtr thisImuMsg, T *acc_x, T 
   *acc_z = thisImuMsg->linear_acceleration.z;
 }
 
+/// Converts the IMU orientation quaternion to roll/pitch/yaw angles (radians).
 template <typename T>
 void imuRPY2rosRPY(sensor_msgs::msg::Imu::SharedPtr thisImuMsg, T *rosRoll, T *rosPitch,
                    T *rosYaw) {
@@ -484,10 +524,12 @@ void imuRPY2rosRPY(sensor_msgs::msg::Imu::SharedPtr thisImuMsg, T *rosRoll, T *r
   *rosYaw = imuYaw;
 }
 
+/// Euclidean distance of a point from the origin (i.e. its range).
  float pointDistance(PointType p) {
   return sqrt(p.x * p.x + p.y * p.y + p.z * p.z);
 }
 
+/// Euclidean distance between two points.
 float pointDistance(PointType p1, PointType p2) {
   return sqrt((p1.x - p2.x) * (p1.x - p2.x) + (p1.y - p2.y) * (p1.y - p2.y) +
               (p1.z - p2.z) * (p1.z - p2.z));

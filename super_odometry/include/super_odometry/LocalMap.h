@@ -140,25 +140,25 @@ public:
   }
 
 
-  Eigen::Vector3i shiftMap(const Eigen::Vector3d &t_w_cur)
+  Eigen::Vector3i shiftMap(const Eigen::Vector3d &t_world_current)
   {
 
     // 计算当前激光的位置相对于栅格地图的位置
     int centerCubeI =
-        int((t_w_cur.x() + halfVoxelResulation) / voxelResulation) +
+        int((t_world_current.x() + halfVoxelResulation) / voxelResulation) +
         origin_.x();
     int centerCubeJ =
-        int((t_w_cur.y() + halfVoxelResulation) / voxelResulation) +
+        int((t_world_current.y() + halfVoxelResulation) / voxelResulation) +
         origin_.y();
     int centerCubeK =
-        int((t_w_cur.z() + halfVoxelResulation) / voxelResulation) +
+        int((t_world_current.z() + halfVoxelResulation) / voxelResulation) +
         origin_.z();
 
-    if (t_w_cur.x() + halfVoxelResulation < 0)
+    if (t_world_current.x() + halfVoxelResulation < 0)
       centerCubeI--;
-    if (t_w_cur.y() + halfVoxelResulation < 0)
+    if (t_world_current.y() + halfVoxelResulation < 0)
       centerCubeJ--;
-    if (t_w_cur.z() + halfVoxelResulation < 0)
+    if (t_world_current.z() + halfVoxelResulation < 0)
       centerCubeK--;
 
     while (centerCubeI < 3)

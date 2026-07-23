@@ -1,5 +1,14 @@
 // Created by Shibo on 2025-03-29.
 //
+// ============================================================================
+// OVERVIEW
+// ============================================================================
+// Implementations for the helpers declared in
+// super_odometry/utils/superodom_utils.h: pose/point transforms between the
+// odometry and map frames, and file I/O for prior maps and start poses.
+// See the header for per-function documentation and for the T_a_b frame
+// naming convention.
+// ============================================================================
 
 #include "super_odometry/utils/superodom_utils.h"
 #include <iostream>
@@ -12,9 +21,11 @@
 namespace super_odometry {
 namespace utils {
 
+// Pose history shared by read/saveLocalizationPose (declared in the header).
 std::vector<OdometryData> odometryResults;
 
 
+// Loads a PCD file into cloud_out, checking first that the file exists.
 bool readPointCloud(const std::string &file_path, pcl::PointCloud<PointType>::Ptr cloud_out) {
     std::ifstream file_check(file_path.c_str());
     if (!file_check.good()) {
@@ -34,10 +45,13 @@ bool readPointCloud(const std::string &file_path, pcl::PointCloud<PointType>::Pt
     return true;
 }
 
+// Reads "start_pose.txt" (one pose per line: duration x y z roll pitch yaw)
+// from the directory of file_path; the first pose is used to initialize
+// localization mode.
 bool readLocalizationPose(const std::string &file_path, std::vector<OdometryData> &odometry_results) {
     std::string localizationPosePath = file_path;
     
-    // If file_path is a directory, append "start_pose.txt"
+    // Replace the file name in file_path with "start_pose.txt"
     size_t lastSlashPos = file_path.find_last_of('/');
     if (lastSlashPos != std::string::npos) {
         std::string directory = file_path.substr(0, lastSlashPos + 1);
@@ -76,7 +90,9 @@ bool readLocalizationPose(const std::string &file_path, std::vector<OdometryData
     return !odometry_results.empty();
 }
 
-bool saveLocalizationPose(double timestamp, const Transformd &T_w_lidar, 
+// Converts the lidar pose to x/y/z + roll/pitch/yaw and appends it to
+// "start_pose.txt" next to file_path, so a later run can resume from it.
+bool saveLocalizationPose(double timestamp, const Transformd &T_world_lidar,
                          const std::string &file_path, std::vector<OdometryData> &odometry_results) {
     std::string saveOdomPath;
     size_t lastSlashPos = file_path.find_last_of('/');
@@ -89,11 +105,14 @@ bool saveLocalizationPose(double timestamp, const Transformd &T_w_lidar,
     OdometryData odom;
     {
         odom.timestamp = timestamp;
-        odom.x = T_w_lidar.pos.x();
-        odom.y = T_w_lidar.pos.y();
-        odom.z = T_w_lidar.pos.z(); 
-        tf2::Quaternion orientation(T_w_lidar.rot.x(), T_w_lidar.rot.y(), T_w_lidar.rot.z(), T_w_lidar.rot.w());
-        tf2::Matrix3x3(orientation).getRPY(odom.roll, odom.pitch, odom.yaw);
+        odom.x = T_world_lidar.pos.x();
+        odom.y = T_world_lidar.pos.y();
+        odom.z = T_world_lidar.pos.z();
+        tf2::Quaternion q_world_lidar(
+            T_world_lidar.rot.x(), T_world_lidar.rot.y(),
+            T_world_lidar.rot.z(), T_world_lidar.rot.w());
+        tf2::Matrix3x3(q_world_lidar).getRPY(
+            odom.roll, odom.pitch, odom.yaw);
     }
 
     odometry_results.push_back(odom);
@@ -114,78 +133,81 @@ bool saveLocalizationPose(double timestamp, const Transformd &T_w_lidar,
     return true;
 }
 
-void transformAssociateToMap(Transformd& T_w_curr, 
-                           const Transformd& T_w_pre, 
-                           const Transformd& T_wodom_curr, 
-                           const Transformd& T_wodom_pre) {
+void transformAssociateToMap(Transformd& T_world_lidar_current,
+                           const Transformd& T_world_lidar_prev,
+                           const Transformd& T_odom_lidar_current,
+                           const Transformd& T_odom_lidar_prev) {
     // Calculate relative transform between previous and current odometry
-    Transformd T_wodom_pre_curr = T_wodom_pre.inverse() * T_wodom_curr;
+    Transformd T_lidar_prev_lidar_current = T_odom_lidar_prev.inverse() * T_odom_lidar_current;
     
     // Apply the relative transform to the previous world pose
-    T_w_curr = T_w_pre * T_wodom_pre_curr;
+    T_world_lidar_current = T_world_lidar_prev * T_lidar_prev_lidar_current;
 }
 
-void transformAssociateToMap(Eigen::Quaterniond& q_w_curr,
-                           Eigen::Vector3d& t_w_curr,
-                           const Eigen::Quaterniond& q_wmap_wodom,
-                           const Eigen::Quaterniond& q_wodom_curr,
-                           const Eigen::Vector3d& t_wodom_curr,
-                           const Eigen::Vector3d& t_wmap_wodom) {
+void transformAssociateToMap(Eigen::Quaterniond& q_world_lidar,
+                           Eigen::Vector3d& t_world_lidar,
+                           const Eigen::Quaterniond& q_map_odom,
+                           const Eigen::Quaterniond& q_odom_lidar_current,
+                           const Eigen::Vector3d& t_odom_lidar_current,
+                           const Eigen::Vector3d& t_map_odom) {
     // Transform from odometry frame to world frame
-    q_w_curr = q_wmap_wodom * q_wodom_curr;
-    t_w_curr = q_wmap_wodom * t_wodom_curr + t_wmap_wodom;
+    q_world_lidar = q_map_odom * q_odom_lidar_current;
+    t_world_lidar = q_map_odom * t_odom_lidar_current + t_map_odom;
 }
 
-void transformUpdate(Eigen::Quaterniond& q_wmap_wodom,
-                    Eigen::Vector3d& t_wmap_wodom,
-                    const Eigen::Quaterniond& q_w_curr,
-                    const Eigen::Quaterniond& q_wodom_curr,
-                    const Eigen::Vector3d& t_w_curr,
-                    const Eigen::Vector3d& t_wodom_curr) {
+void transformUpdate(Eigen::Quaterniond& q_map_odom,
+                    Eigen::Vector3d& t_map_odom,
+                    const Eigen::Quaterniond& q_world_lidar,
+                    const Eigen::Quaterniond& q_odom_lidar_current,
+                    const Eigen::Vector3d& t_world_lidar,
+                    const Eigen::Vector3d& t_odom_lidar_current) {
     // Update the transform between world and odometry frames
-    q_wmap_wodom = q_w_curr * q_wodom_curr.inverse();
-    t_wmap_wodom = t_w_curr - q_wmap_wodom * t_wodom_curr;
+    q_map_odom = q_world_lidar * q_odom_lidar_current.inverse();
+    t_map_odom = t_world_lidar - q_map_odom * t_odom_lidar_current;
 }
 
 void pointAssociateToMap(PointType const *const pi, PointType *const po,
-                        const Eigen::Quaterniond& q_w_curr,
-                        const Eigen::Vector3d& t_w_curr) {
-    // Transform point from current frame to world frame
-    Eigen::Vector3d point_curr(pi->x, pi->y, pi->z);
-    Eigen::Vector3d point_w = q_w_curr * point_curr + t_w_curr;
-    po->x = point_w.x();
-    po->y = point_w.y();
-    po->z = point_w.z();
+                        const Eigen::Quaterniond& q_world_lidar,
+                        const Eigen::Vector3d& t_world_lidar) {
+    // Transform point from the lidar frame to the world frame
+    Eigen::Vector3d point_lidar(pi->x, pi->y, pi->z);
+    Eigen::Vector3d point_world = q_world_lidar * point_lidar + t_world_lidar;
+    po->x = point_world.x();
+    po->y = point_world.y();
+    po->z = point_world.z();
     po->intensity = pi->intensity;
 }
 
 void pointAssociateToMap(pcl::PointXYZHSV const *const pi, pcl::PointXYZHSV *const po,
-                        const Eigen::Quaterniond& q_w_curr,
-                        const Eigen::Vector3d& t_w_curr) {
-    // Transform HSV point from current frame to world frame
-    Eigen::Vector3d point_curr(pi->x, pi->y, pi->z);
-    Eigen::Vector3d point_w = q_w_curr * point_curr + t_w_curr;
-    po->x = point_w.x();
-    po->y = point_w.y();
-    po->z = point_w.z();
+                        const Eigen::Quaterniond& q_world_lidar,
+                        const Eigen::Vector3d& t_world_lidar) {
+    // Transform HSV point from the lidar frame to the world frame
+    Eigen::Vector3d point_lidar(pi->x, pi->y, pi->z);
+    Eigen::Vector3d point_world = q_world_lidar * point_lidar + t_world_lidar;
+    po->x = point_world.x();
+    po->y = point_world.y();
+    po->z = point_world.z();
     po->h = pi->h;
     po->s = pi->s;
     po->v = pi->v;
 }
 
 void pointAssociateTobeMapped(PointType const *const pi, PointType *const po,
-                            const Eigen::Quaterniond& q_w_curr,
-                            const Eigen::Vector3d& t_w_curr) {
-    // Transform point from world frame to current frame
-    Eigen::Vector3d point_w(pi->x, pi->y, pi->z);
-    Eigen::Vector3d point_curr = q_w_curr.inverse() * (point_w - t_w_curr);
-    po->x = point_curr.x();
-    po->y = point_curr.y();
-    po->z = point_curr.z();
+                            const Eigen::Quaterniond& q_world_lidar,
+                            const Eigen::Vector3d& t_world_lidar) {
+    // Transform point from the world frame to the lidar frame
+    Eigen::Vector3d point_world(pi->x, pi->y, pi->z);
+    Eigen::Vector3d point_lidar = q_world_lidar.inverse() * (point_world - t_world_lidar);
+    po->x = point_lidar.x();
+    po->y = point_lidar.y();
+    po->z = point_lidar.z();
     po->intensity = pi->intensity;
 }
 
 
+// Builds a quaternion that keeps only the roll and pitch of the given IMU
+// orientation (yaw forced to zero). Used to inject the gravity direction
+// into ICP without constraining the heading.
 tf2::Quaternion extractRollPitch(Eigen::Quaterniond& imu_rotation){
     double imu_roll, imu_pitch, imu_yaw;
     tf2::Quaternion orientation(imu_rotation.x(), imu_rotation.y(), imu_rotation.z(), imu_rotation.w());
@@ -201,15 +223,18 @@ void printTransform(const Transformd& T, const std::string& name){
     std::cout<<name<<": "<<T.rot<<std::endl;
 }
 
+// Applies a rigid transform to an Ouster point: p_out = R * p_in + t.
 void transformOusterPoints(point_os::OusterPointXYZIRT const *const pi, point_os::PointcloudXYZITR *const po, Transformd &transform) {
-    Eigen::Vector3d point_curr(pi->x, pi->y, pi->z);
-    Eigen::Vector3d point_w = transform.rot * point_curr + transform.pos;
-    po->x = point_w.x();
-    po->y = point_w.y();
-    po->z = point_w.z();
+    Eigen::Vector3d point_input(pi->x, pi->y, pi->z);
+    Eigen::Vector3d point_transformed = transform.rot * point_input + transform.pos;
+    po->x = point_transformed.x();
+    po->y = point_transformed.y();
+    po->z = point_transformed.z();
     po->intensity = pi->intensity;
 }
 
+// Writes the accumulated cloud to <ROOT_DIR>/PLY/saved_scans.ply, but only
+// every 10th call (when the point count is a multiple of 10) to limit disk I/O.
 bool savePly(pcl::PointCloud<PointType>::Ptr pcl_to_save, rclcpp::Node::SharedPtr node) {
     if (pcl_to_save->size() >= 10 && pcl_to_save->size() % 10 == 0) {
         std::string las_dir = std::string(ROOT_DIR) + "PLY";

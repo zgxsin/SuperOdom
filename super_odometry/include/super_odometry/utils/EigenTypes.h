@@ -1,5 +1,25 @@
 #pragma once
 
+// ============================================================================
+// OVERVIEW
+// ============================================================================
+// Convenience type aliases for Eigen, injected into the Eigen namespace.
+// This file contains no logic; it provides two things:
+//
+//   1. Aligned STL containers (aligned_vector, aligned_map, ...): standard
+//      containers that use Eigen's aligned allocator. Fixed-size Eigen types
+//      need 16/32-byte memory alignment for SIMD, which the default STL
+//      allocator does not guarantee; use these aliases whenever a container
+//      stores Eigen matrices or structs that contain them.
+//
+//   2. Short names for fixed-size matrices and vectors, following the
+//      pattern Mat<rows><cols><type> and Vec<size><type>, where the type
+//      suffix is u = unsigned char, ui = unsigned int, i = int, f = float,
+//      d = double. For example Mat33d is a 3x3 double matrix and Vec6f is a
+//      6x1 float vector. The most used ones here are the double variants
+//      (Mat33d, Mat44d, Vec3d, Vec6d, ...).
+// ============================================================================
+
 #include <deque>
 #include <map>
 #include <unordered_map>
@@ -9,7 +29,7 @@
 #include <Eigen/Dense>
 // Eigen typedefs matrices and vectors
 
-// Eigen typedefs matrices and vectors
+// STL containers with Eigen's aligned allocator (safe for fixed-size types).
 namespace Eigen
 {
 template<typename T>
@@ -29,6 +49,10 @@ std::unordered_map<K, V, std::hash<K>, std::equal_to<K>,
                    Eigen::aligned_allocator<std::pair<K const, V>>>;
 
 } //namespace Eigen
+
+// Short names for fixed-size matrices/vectors: Mat<rows><cols><type> and
+// Vec<size><type>. The sections below repeat the same grid of sizes for
+// each scalar type (u, ui, i, f, d).
 namespace Eigen
 {
 

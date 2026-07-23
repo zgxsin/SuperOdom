@@ -1,6 +1,52 @@
 //
 // Created by ubuntu on 2020/6/27.
 //
+// ============================================================================
+// OVERVIEW (read this first)
+// ============================================================================
+// This file implements the rolling LOCAL MAP used by the scan-registration
+// (laserMapping) stage of the pipeline:
+//
+//   featureExtraction (deskewed edge/planar features)
+//     -> laserMapping registers each new scan against THIS LocalMap
+//     -> the resulting pose is fused with the IMU in imuPreintegration.
+//
+// Why a "local" map? Registering a scan needs many nearest-neighbor lookups
+// ("give me the 5 map points closest to this scan point"). Searching one
+// giant, ever-growing global cloud would get slower every second. Instead we
+// keep only a fixed-size neighborhood of the robot, organized for fast
+// queries, and let old geometry fall off the back as the robot moves.
+//
+// Data structure (three levels):
+//
+//   1. A fixed 3D grid of 21 x 21 x 11 = 4851 blocks (MapBlock). Each block
+//      is a 50 m cube, so the map spans roughly 1050 x 1050 x 550 m of the
+//      world around the robot. The grid is stored as a flat std::array and a
+//      cell (i,j,k) lives at index
+//          cubeInd = i + laserCloudWidth * j + laserCloudWidth * laserCloudHeight * k
+//      (the usual row-major flattening of a 3D array).
+//
+//   2. Each MapBlock stores two separate point clouds: EDGE points (sharp,
+//      line-like features) and SURF points (flat, plane-like features),
+//      because scan registration matches edges to lines and surfs to planes.
+//
+//   3. Each cloud inside a block has its own octree (see flann/octree.h)
+//      rebuilt after every insertion, so nearest-neighbor queries only ever
+//      search the single 50 m block containing the query point.
+//
+// Rolling behavior: the grid never grows. origin_ maps world coordinates to
+// grid indices. When the robot approaches the border of the grid, shiftMap()
+// slides all blocks over by whole cells (dropping the row that falls off the
+// far side) and updates origin_, exactly like the cube-shifting logic in
+// LOAM / A-LOAM's laserMapping.
+//
+// Coordinate convention used everywhere below: a world point p falls in cell
+//   i = floor((p.x + 25) / 50) + origin_.x()   (same for j/k with y/z)
+// The +25 (half a block) centers cell boundaries so that cell (0,0,0) in
+// world-voxel coordinates covers [-25, 25) on each axis. The explicit
+// "if (p.x + 25 < 0) i--;" lines implement floor() for negative values,
+// because integer casting in C++ truncates toward zero.
+// ============================================================================
 
 #ifndef LOCALMAPOCTREE_H
 #define LOCALMAPOCTREE_H
@@ -31,8 +77,15 @@
 #include "super_odometry/flann/nanoflann.h"
 #include "super_odometry/flann/octree.h"
 
+// If defined, fall back to PCL's kd-tree instead of the custom octree in
+// super_odometry/flann/octree.h. Left disabled: the custom octree is faster
+// to (re)build, which matters because every block rebuilds its tree each
+// time new points are inserted.
 //#define DONT_USE_SELF_OCTREE
 
+/// One 50 m cube of the local map. It owns two feature clouds (edge and
+/// surf) plus one nearest-neighbor search tree per cloud. Blocks start empty
+/// and are lazily allocated on first insertion.
 struct MapBlock {
 
     // Usefull types
@@ -41,10 +94,18 @@ struct MapBlock {
     using PointCloud = pcl::PointCloud<Point>;
 
     MapBlock() = default;
-    // 点运数据
+
+    // ---- point data -----------------------------------------------------
+    // Edge (line-like) and surf (plane-like) features are kept in separate
+    // clouds because scan registration fits different geometric models to
+    // each (point-to-line vs point-to-plane residuals).
     pcl::PointCloud<Point>::Ptr pedge_pc_ = nullptr;
     pcl::PointCloud<Point>::Ptr psurf_pc_ = nullptr;
 
+    // ---- search structures ------------------------------------------------
+    // One tree per cloud, rebuilt by LocalMap::add*PointCloud() after every
+    // insertion. Named "kdtree" for historical reasons; the default build
+    // actually uses the custom octree.
 #ifdef DONT_USE_SELF_OCTREE
     pcl::KdTreeFLANN<Point>::Ptr pkdtree_edge_from_block_ = nullptr;
     pcl::KdTreeFLANN<Point>::Ptr pkdtree_surf_from_block_ = nullptr;
@@ -53,13 +114,15 @@ struct MapBlock {
     std::shared_ptr<nanoflann::Octree<Point, Eigen::aligned_vector<Point>>> pkdtree_surf_from_block_ = nullptr;
 #endif
 
-    // 标志位
-    bool bnull_ = true;
-    bool bline_null_ = true;
-    bool bsurf_null_ = true;
-    bool bnewline_points_add_ = false;
-    bool bnewsurf_points_add_ = false;
+    // ---- status flags -----------------------------------------------------
+    bool bnull_ = true;               // true while the block holds no points at all
+    bool bline_null_ = true;          // true while the block holds no edge points
+    bool bsurf_null_ = true;          // true while the block holds no surf points
+    bool bnewline_points_add_ = false;// set externally when fresh edge points arrived
+    bool bnewsurf_points_add_ = false;// set externally when fresh surf points arrived
 
+    /// Drops all points and trees, returning the block to its empty state.
+    /// Called when the rolling map shifts and this cell is recycled.
     inline void clear() {
         pedge_pc_ = nullptr;
         psurf_pc_ = nullptr;
@@ -74,6 +137,9 @@ struct MapBlock {
         bnewsurf_points_add_ = false;
     }
 
+    /// Appends one edge point, allocating the cloud on first use. Note this
+    /// only stores the point; the search tree is rebuilt later in batch by
+    /// LocalMap::addEdgePointCloud().
     inline void insertEdgePoint(const Point &point) {
         if(pedge_pc_ == nullptr) {
             pedge_pc_.reset(new pcl::PointCloud<Point>());
@@ -85,6 +151,10 @@ struct MapBlock {
         pedge_pc_->push_back(point);
     }
 
+    /// Appends one surf point, allocating the cloud on first use.
+    /// (Note: the flag update below clears bline_null_ instead of
+    /// bsurf_null_, which looks like a copy-paste bug in the original code;
+    /// surfPointsIsEmpty() may stay true even after surf points were added.)
     inline void insertSurfPoint(const Point &point) {
         if(psurf_pc_ == nullptr) {
             psurf_pc_.reset(new pcl::PointCloud<Point>());
@@ -119,6 +189,11 @@ struct MapBlock {
     inline bool haveNewsurfPoints() const { return bnewsurf_points_add_; }
 };
 
+/// Rolling grid of MapBlock cells centered (approximately) on the robot.
+/// laserMapping uses it in a simple cycle for every scan:
+///   1. shiftMap(robot position)          - keep the robot near the center
+///   2. nearestKSearch*(...)              - data association for registration
+///   3. addEdgePointCloud/addSurfPointCloud - insert the newly aligned scan
 class LocalMap {
 public:
     // Usefull types
@@ -128,32 +203,42 @@ public:
 
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 
+    // ---- grid dimensions -------------------------------------------------
+    // Number of blocks along x, y, z. The grid is intentionally flatter in z
+    // (11 vs 21) because ground robots move mostly horizontally.
     static constexpr const int laserCloudWidth = 21;
     static constexpr const int laserCloudHeight = 21;
     static constexpr int laserCloudDepth = 11;
 
     static constexpr int laserCloudNum = laserCloudWidth * laserCloudHeight * laserCloudDepth;  // 4851
 
+    // Edge length of one block in meters ("voxel" here means one 50 m map
+    // block, not the small voxels of the downsampling filter below).
     static constexpr double voxelResulation = 50;
     static constexpr double halfVoxelResulation = voxelResulation * 0.5;
 
 public:
     LocalMap() {
-        // step1: 设置localmap 原点相对于栅格的位置
+        // Start with the world origin mapped to the center cell of the grid,
+        // so the map initially extends equally in all directions.
         origin_ = Eigen::Vector3i(laserCloudWidth * 0.5, laserCloudHeight * 0.5, laserCloudDepth * 0.5);
     }
 
-    Eigen::Vector3i setOrigin(const Eigen::Vector3d &t_w_cur) {
-        // 计算当前激光位置相对于栅格地图的位置
-        int centerCubeI = int((t_w_cur.x() + halfVoxelResulation) / voxelResulation);
-        int centerCubeJ = int((t_w_cur.y() + halfVoxelResulation) / voxelResulation);
-        int centerCubeK = int((t_w_cur.z() + halfVoxelResulation) / voxelResulation);
+    /// Re-anchors the grid so that the given world position t_world_current falls in
+    /// cell (0,0,0). Only used for (re)initialization; during normal
+    /// operation shiftMap() moves the grid incrementally instead.
+    Eigen::Vector3i setOrigin(const Eigen::Vector3d &t_world_current) {
+        // Which world-voxel does the robot occupy? (floor division; the
+        // decrements below fix truncation-toward-zero for negative coords)
+        int centerCubeI = int((t_world_current.x() + halfVoxelResulation) / voxelResulation);
+        int centerCubeJ = int((t_world_current.y() + halfVoxelResulation) / voxelResulation);
+        int centerCubeK = int((t_world_current.z() + halfVoxelResulation) / voxelResulation);
 
-        if(t_w_cur.x() + halfVoxelResulation < 0)
+        if(t_world_current.x() + halfVoxelResulation < 0)
             centerCubeI--;
-        if(t_w_cur.y() + halfVoxelResulation < 0)
+        if(t_world_current.y() + halfVoxelResulation < 0)
             centerCubeJ--;
-        if(t_w_cur.z() + halfVoxelResulation < 0)
+        if(t_world_current.z() + halfVoxelResulation < 0)
             centerCubeK--;
 
         origin_.x() = -centerCubeI;
@@ -163,23 +248,38 @@ public:
         return origin_;
     }  // function setOrigin end
 
-    /// \brief 移动栅格
-    /// \param t_w_cur
-    /// \return 当前激光点在在栅格中的位置
-    Eigen::Vector3i shiftMap(const Eigen::Vector3d &t_w_cur) {
+    /// \brief Slides the rolling grid so the robot stays away from its edges.
+    ///
+    /// If the robot's cell gets within 3 cells of any face of the grid, all
+    /// blocks are shifted by one cell along that axis (repeatedly, if
+    /// needed): every block is copied to its neighbor slot, the row that
+    /// falls off the far side is cleared (its geometry is forgotten), and
+    /// origin_ is updated so world-to-cell conversion stays consistent.
+    /// The margin of 3 guarantees the 5x5x3 query neighborhood used by the
+    /// get5x5* functions always lies inside the grid.
+    ///
+    /// \param t_world_current current robot position in the world frame (meters)
+    /// \return the robot's cell index (i,j,k) after shifting
+    Eigen::Vector3i shiftMap(const Eigen::Vector3d &t_world_current) {
 
-        // 计算当前激光的位置相对于栅格地图的位置
-        int centerCubeI = int((t_w_cur.x() + halfVoxelResulation) / voxelResulation) + origin_.x();
-        int centerCubeJ = int((t_w_cur.y() + halfVoxelResulation) / voxelResulation) + origin_.y();
-        int centerCubeK = int((t_w_cur.z() + halfVoxelResulation) / voxelResulation) + origin_.z();
+        // Convert the world position to grid indices (floor division as in
+        // setOrigin).
+        int centerCubeI = int((t_world_current.x() + halfVoxelResulation) / voxelResulation) + origin_.x();
+        int centerCubeJ = int((t_world_current.y() + halfVoxelResulation) / voxelResulation) + origin_.y();
+        int centerCubeK = int((t_world_current.z() + halfVoxelResulation) / voxelResulation) + origin_.z();
 
-        if(t_w_cur.x() + halfVoxelResulation < 0)
+        if(t_world_current.x() + halfVoxelResulation < 0)
             centerCubeI--;
-        if(t_w_cur.y() + halfVoxelResulation < 0)
+        if(t_world_current.y() + halfVoxelResulation < 0)
             centerCubeJ--;
-        if(t_w_cur.z() + halfVoxelResulation < 0)
+        if(t_world_current.z() + halfVoxelResulation < 0)
             centerCubeK--;
 
+        // Robot too close to the low-x face: shift every block one step in
+        // +x. The slab at i = laserCloudWidth-1 is overwritten (dropped) and
+        // the freed slab at i = 0 receives the recycled, cleared blocks.
+        // The remaining five loops below are the same pattern for the other
+        // face/axis combinations.
         while(centerCubeI < 3) {
             for(int j = 0; j < laserCloudHeight; j++) {
                 for(int k = 0; k < laserCloudDepth; k++) {
@@ -286,9 +386,12 @@ public:
         return Eigen::Vector3i{centerCubeI, centerCubeJ, centerCubeK};
     }  // function shiftMap
 
-    /// \brief 获取局部5x5栅格局部地图中的line, surf点
-    /// \param position　机器人在局部地图中位置
-    /// \return std::tuple<int, int> line, surf point size
+    /// \brief Counts the edge and surf points in the 5x5x3 block neighborhood
+    /// around the robot (2 blocks in each horizontal direction, 1 vertically,
+    /// i.e. roughly 250 x 250 x 150 m). laserMapping uses these counts to
+    /// decide whether the map is populated enough to attempt registration.
+    /// \param position robot cell index, as returned by shiftMap()
+    /// \return std::tuple<int, int> = (edge point count, surf point count)
     std::tuple<int, int> get5x5LocalMapFeatureSize(const Eigen::Vector3i &position) {
 
         int centerCubeI, centerCubeJ, centerCubeK;
@@ -317,17 +420,26 @@ public:
         return std::make_tuple(laserCloudLineFromMapNum, laserCloudSurfFromMapNum);
     }  // function get_localmap_featuresize
 
-    /// \brief 搜索最近邻角点
-    /// \param pt_query
-    /// \param k_indices
-    /// \param k_sqr_distances
-    /// \return
+    /// \brief Finds the 5 edge points nearest to pt_query.
+    ///
+    /// Only the single block containing the query is searched. This is the
+    /// key speed trick of this class: the tree in one 50 m block is tiny
+    /// compared to the whole map. The trade-off is that neighbors lying just
+    /// across a block boundary are missed, which is acceptable because
+    /// matched features are expected to be within ~1 m of the query.
+    ///
+    /// \param pt_query        query point in world coordinates
+    /// \param k_pts           the neighbor points themselves (output)
+    /// \param k_sqr_distances squared distances to each neighbor, in m^2 (output)
+    /// \return false if the query is outside the grid or the block has no tree yet
     bool nearestKSearchEdgePoint(const Point &pt_query,
                                  std::vector<Point> &k_pts,
                                  std::vector<float> &k_sqr_distances) const {
 
         k_pts.clear();
 
+        // Locate the block containing the query (same floor-division
+        // pattern as in shiftMap).
         int cubeI = int((pt_query.x + halfVoxelResulation) / voxelResulation) + origin_.x();
         int cubeJ = int((pt_query.y + halfVoxelResulation) / voxelResulation) + origin_.y();
         int cubeK = int((pt_query.z + halfVoxelResulation) / voxelResulation) + origin_.z();
@@ -366,13 +478,24 @@ public:
     }  // function nearestKSearchLinePoint
 
     /**
-     * \brief
-     * @param [in]  pt_query
-     * @param [out] k_pts
-     * @param [out] k_sqr_distances
-     * @param [in]  num_nearest_search　knn搜寻一定数量的点
-     * @param [in]  max_dist_inliner   点到直线的距离的阈值
-     * @return
+     * \brief Like nearestKSearchEdgePoint, but additionally filters the
+     * neighbors with a small RANSAC-style line fit, so the caller gets only
+     * points that actually lie on one line.
+     *
+     * Edge features should come from linear structures (poles, wall
+     * corners). A plain kNN result can mix points from two different
+     * structures, which would corrupt the point-to-line residual. This
+     * method tries every line through the closest neighbor P1 and one other
+     * neighbor P2, counts how many of the remaining neighbors lie within
+     * max_dist_inliner of that line, and returns P1 plus the inliers of the
+     * best line.
+     *
+     * @param [in]  pt_query           query point in world coordinates
+     * @param [out] k_pts              closest point + inliers of the best line
+     * @param [out] k_sqr_distances    squared distances of those points to the query
+     * @param [in]  num_nearest_search how many raw kNN candidates to fetch
+     * @param [in]  max_dist_inliner   max point-to-line distance (m) to count as inlier
+     * @return false if the query falls outside the grid or the block is empty
      */
     bool nearestKSearchSpecificEdgePoint(const Point &pt_query,
                                          std::vector<Point> &k_pts,
@@ -437,6 +560,9 @@ public:
                     inlier_index.push_back(candidate_index);
                 else {
                     const auto Pcdt = previousEdgePoints[nearestIndex[candidate_index]].getVector3fMap();
+                    // Distance from Pcdt to the line (P1, dir): since dir is
+                    // a unit vector, |(Pcdt - P1) x dir| is exactly that
+                    // perpendicular distance.
                     if(((Pcdt - P1).cross(dir)).squaredNorm() < square_max_dist_inliner) {
                         inlier_index.push_back(candidate_index);
                     }
@@ -473,11 +599,14 @@ public:
         return true;
     }  // function nearestKSearchSpecificLinePoint
 
-    /// \brief 检索最近邻的surf点
-    /// \param pt_query
-    /// \param k_indices
-    /// \param k_sqr_distances
-    /// \return
+    /// \brief Finds the num_nearest_search surf points nearest to pt_query.
+    /// Same single-block strategy as nearestKSearchEdgePoint; the caller
+    /// typically fits a plane to the result for a point-to-plane residual.
+    /// \param pt_query           query point in world coordinates
+    /// \param k_pts              the neighbor points themselves (output)
+    /// \param k_sqr_distances    squared distances in m^2 (output)
+    /// \param num_nearest_search number of neighbors to return
+    /// \return false if the query is outside the grid or the block has no tree yet
     bool nearestKSearchSurf(const Point &pt_query,
                             std::vector<Point> &k_pts,
                             std::vector<float> &k_sqr_distances,
@@ -524,11 +653,19 @@ public:
         return true;
     }  // function nearestKSearch_surf
 
-    /// \brief 添加line点, 并进行体素滤波和构建kdtree
-    /// \param laserCloudEdgeStack
+    /// \brief Inserts a registered scan's edge points into the map, then
+    /// re-downsamples and rebuilds the search tree of every touched block.
+    ///
+    /// Downsampling with a voxel grid (leaf size lineRes_) after each
+    /// insertion keeps the map density bounded no matter how often the robot
+    /// revisits an area; without it the map would grow and queries would
+    /// slow down over time. Points outside the rolling grid are silently
+    /// discarded.
+    /// \param laserCloudEdgeStack edge features already transformed into the world frame
     void addEdgePointCloud(pcl::PointCloud<Point> &laserCloudEdgeStack) {
 
-        // step1: 确定新的一帧点云都分布在哪些block里,并将激光点添加到对应的block中
+        // step1: route each point to its block and remember which blocks
+        // were touched, so only those get re-filtered and re-indexed.
         std::set<int> blockInd;
         for(const auto &point : laserCloudEdgeStack) {
             int cubeI = int((point.x + halfVoxelResulation) / voxelResulation) + origin_.x();
@@ -550,9 +687,10 @@ public:
             }
         }
 
-        // TODO: 体素网格过滤和重新构建kdtree
-        // step2: 并行检索新添加点分布的block,对block中的点云进行下采样
-        //并且重新构造kdtree
+        // step2: in parallel (TBB) over the touched blocks: voxel-filter the
+        // block's cloud back down to lineRes_ density and rebuild its octree
+        // from scratch. Parallelism is safe because each block is touched by
+        // exactly one thread.
         std::vector<int> vblockInd(blockInd.begin(), blockInd.end());
 
         auto compute_func = [&](const tbb::blocked_range<std::vector<int>::iterator> &range) {
@@ -586,8 +724,11 @@ public:
         tbb::parallel_for(range, compute_func);
     }  // function addLinePointCloud
 
-    /// \brief 添加surf点,并进行体素滤波和构建kdtree
-    /// \param laserCloudSurfStack
+    /// \brief Surf-point counterpart of addEdgePointCloud: routes points to
+    /// blocks, voxel-filters each touched block at planeRes_ (coarser than
+    /// edges, since planar areas have many redundant points), and rebuilds
+    /// the block's octree.
+    /// \param laserCloudSurfStack surf features already transformed into the world frame
     void addSurfPointCloud(pcl::PointCloud<Point> &laserCloudSurfStack) {
 
         std::set<int> blockInd;
@@ -644,6 +785,8 @@ public:
         tbb::parallel_for(range, compute_func);
     }  // function addSurfPointCloud
 
+    /// Concatenates every stored point (edge + surf, all blocks) into one
+    /// cloud. Used for visualization/publishing, not for registration.
     pcl::PointCloud<Point> getAllLocalMap() const {
         pcl::PointCloud<Point> laserCloudMap;
 
@@ -657,6 +800,9 @@ public:
         return laserCloudMap;
     }  // function get_all_localmap
 
+    /// Returns edge + surf points from the 5x5x3 neighborhood around the
+    /// given robot cell (the same neighborhood counted by
+    /// get5x5LocalMapFeatureSize).
     pcl::PointCloud<Point> get5x5LocalMap(const Eigen::Vector3i &position) const {
         pcl::PointCloud<Point> laserCloudMap;
 
@@ -686,6 +832,8 @@ public:
         return laserCloudMap;
     }  // function get_5x5_localmap
 
+    /// Same neighborhood as get5x5LocalMap but returns only edge (corner)
+    /// points.
     pcl::PointCloud<Point>
     get_5x5_localmap_corner(const Eigen::Vector3i &position) const
     {
@@ -719,6 +867,8 @@ public:
         return laserCloudMap;
     } // function get_5x5_localmap_corner
 
+    /// Same neighborhood as get5x5LocalMap but returns only surf (planar)
+    /// points.
     pcl::PointCloud<Point>
     get_5x5_localmap_surf(const Eigen::Vector3i &position) const
     {
@@ -754,12 +904,19 @@ public:
     } // function get_5x5_localmap_corner
 
 public:
-    // localmap
+    // ---- storage ----------------------------------------------------------
+    // All 4851 blocks in a flat array, indexed by
+    // i + laserCloudWidth * j + laserCloudWidth * laserCloudHeight * k.
     std::array<MapBlock, laserCloudNum> map_;
 
+    // Voxel-grid leaf sizes (m) used when downsampling block clouds. Edges
+    // are kept denser (0.2 m) than surfaces (0.4 m) because there are far
+    // fewer edge points and they carry more localization information.
     float lineRes_ = 0.2;
     float planeRes_ = 0.4;
 
+    // Offset added to world-voxel indices to get grid indices; updated by
+    // setOrigin()/shiftMap() as the map rolls with the robot.
     Eigen::Vector3i origin_;
 };
 

@@ -1,4 +1,25 @@
 // Created by Shibo Zhao on 2025-03-31
+//
+// ============================================================================
+// OVERVIEW
+// ============================================================================
+// Grab-bag of helper functions used mainly by the laserMapping node:
+//
+//   - Frame/transform helpers (transformAssociateToMap, transformUpdate):
+//     maintain the correction between the incremental odometry frame and the
+//     drift-corrected map frame. Naming follows T_frame_reference_frame_body,
+//     e.g. T_world_lidar_current is the current lidar pose in the world frame
+//     and T_odom_lidar_current is the same pose in the odometry frame.
+//   - Point transforms (pointAssociateToMap and friends): move individual
+//     lidar points between the sensor frame and the world/map frame.
+//   - File I/O (readPointCloud, read/saveLocalizationPose, savePly):
+//     load prior maps and save/restore start poses for localization mode.
+//   - Small math utilities: PCA of point sets (used for plane/line fitting),
+//     degree/radian conversion, timing (ScopedTimer).
+//
+// Declarations live here; non-template definitions are in
+// src/utils/superodom_utils.cpp.
+// ============================================================================
 
 # pragma once
 #ifndef SUPER_ODOMETRY_LASER_MAPPING_UTILS_H
@@ -23,6 +44,8 @@ namespace super_odometry {
 namespace utils {
 
 
+/// RAII stopwatch: construct at the top of a scope and it logs (at DEBUG
+/// level) how many milliseconds the scope took when it is destroyed.
 class ScopedTimer {
 public:
     explicit ScopedTimer(const std::string& name, rclcpp::Logger logger = rclcpp::get_logger("ScopedTimer"))
@@ -43,87 +66,124 @@ private:
 };
 
 
+/// One pose sample as read from / written to the start_pose.txt file:
+/// position + roll/pitch/yaw plus timing information.
 struct OdometryData {
     double timestamp;
-    double duration;
+    double duration;   // seconds since the first saved pose
     double x, y, z;
     double roll, pitch, yaw;
 };
 
+// Shared pose history used by read/saveLocalizationPose (defined in the .cpp).
 extern std::vector<OdometryData> odometryResults;
 
-void transformAssociateToMap(Transformd& T_w_curr, 
-                           const Transformd& T_w_pre, 
-                           const Transformd& T_wodom_curr, 
-                           const Transformd& T_wodom_pre);
+void transformAssociateToMap(Transformd& T_world_lidar_current,
+                           const Transformd& T_world_lidar_prev,
+                           const Transformd& T_odom_lidar_current,
+                           const Transformd& T_odom_lidar_prev);
 
-inline void transformUpdate(const Eigen::Quaterniond &q_w_curr, const Eigen::Vector3d &t_w_curr,
-                           const Eigen::Quaterniond &q_wodom_curr, const Eigen::Vector3d &t_wodom_curr,
-                           Eigen::Quaterniond &q_wmap_wodom, Eigen::Vector3d &t_wmap_wodom) {
-    q_wmap_wodom = q_w_curr * q_wodom_curr.inverse();
-    t_wmap_wodom = t_w_curr - q_wmap_wodom * t_wodom_curr;
+/// Recomputes the map-to-odometry correction after mapping has refined the
+/// current pose: T_map_odom = T_world_lidar * T_odom_lidar^-1, split into a
+/// quaternion and a translation.
+inline void transformUpdate(const Eigen::Quaterniond &q_world_lidar, const Eigen::Vector3d &t_world_lidar,
+                           const Eigen::Quaterniond &q_odom_lidar_current, const Eigen::Vector3d &t_odom_lidar_current,
+                           Eigen::Quaterniond &q_map_odom, Eigen::Vector3d &t_map_odom) {
+    q_map_odom = q_world_lidar * q_odom_lidar_current.inverse();
+    t_map_odom = t_world_lidar - q_map_odom * t_odom_lidar_current;
 }
 
 
+/// Loads a PCD file into cloud_out; returns false if the file is missing or
+/// unreadable. Used to load a prior map in localization mode.
 bool readPointCloud(const std::string &file_path, pcl::PointCloud<PointType>::Ptr cloud_out);
 
 
+/// Reads saved poses from "start_pose.txt" (in the directory of file_path)
+/// into odometry_results; the first entry serves as the initial pose.
 bool readLocalizationPose(const std::string &file_path, std::vector<OdometryData> &odometry_results);
 
 
-bool saveLocalizationPose(double timestamp, const Transformd &T_w_lidar, 
+/// Appends the given lidar pose to "start_pose.txt" so a later run can start
+/// from it.
+bool saveLocalizationPose(double timestamp, const Transformd &T_world_lidar,
                          const std::string &file_path, std::vector<OdometryData> &odometry_results);
 
 // Transform utilities
-void transformAssociateToMap(Transformd& T_w_curr, 
-                           const Transformd& T_w_pre, 
-                           const Transformd& T_wodom_curr, 
-                           const Transformd& T_wodom_pre);
 
-void transformAssociateToMap(Eigen::Quaterniond& q_w_curr,
-                           Eigen::Vector3d& t_w_curr,
-                           const Eigen::Quaterniond& q_wmap_wodom,
-                           const Eigen::Quaterniond& q_wodom_curr,
-                           const Eigen::Vector3d& t_wodom_curr,
-                           const Eigen::Vector3d& t_wmap_wodom);
+/// Predicts the current map-frame pose from the previous map-frame pose and
+/// the relative motion measured by odometry:
+/// T_world_lidar_current = T_world_lidar_prev *
+///     (T_odom_lidar_prev^-1 * T_odom_lidar_current).
+void transformAssociateToMap(Transformd& T_world_lidar_current,
+                           const Transformd& T_world_lidar_prev,
+                           const Transformd& T_odom_lidar_current,
+                           const Transformd& T_odom_lidar_prev);
 
-void transformUpdate(Eigen::Quaterniond& q_wmap_wodom,
-                    Eigen::Vector3d& t_wmap_wodom,
-                    const Eigen::Quaterniond& q_w_curr,
-                    const Eigen::Quaterniond& q_wodom_curr,
-                    const Eigen::Vector3d& t_w_curr,
-                    const Eigen::Vector3d& t_wodom_curr);
+/// Quaternion+vector variant: applies the map-to-odometry correction to an
+/// odometry-frame pose to get the map-frame pose.
+void transformAssociateToMap(Eigen::Quaterniond& q_world_lidar,
+                           Eigen::Vector3d& t_world_lidar,
+                           const Eigen::Quaterniond& q_map_odom,
+                           const Eigen::Quaterniond& q_odom_lidar_current,
+                           const Eigen::Vector3d& t_odom_lidar_current,
+                           const Eigen::Vector3d& t_map_odom);
 
+/// Same as the inline transformUpdate above but with output arguments first;
+/// recomputes the map-to-odometry correction after a mapping update.
+void transformUpdate(Eigen::Quaterniond& q_map_odom,
+                    Eigen::Vector3d& t_map_odom,
+                    const Eigen::Quaterniond& q_world_lidar,
+                    const Eigen::Quaterniond& q_odom_lidar_current,
+                    const Eigen::Vector3d& t_world_lidar,
+                    const Eigen::Vector3d& t_odom_lidar_current);
+
+/// Transforms one point from the sensor frame into the world/map frame:
+/// p_out = q_world_lidar * p_in + t_world_lidar.
 void pointAssociateToMap(PointType const *const pi, PointType *const po,
-                        const Eigen::Quaterniond& q_w_curr,
-                        const Eigen::Vector3d& t_w_curr);
+                        const Eigen::Quaterniond& q_world_lidar,
+                        const Eigen::Vector3d& t_world_lidar);
 
+/// Overload for XYZHSV points (used for the feature clouds that store extra
+/// per-point attributes in the h/s/v channels).
 void pointAssociateToMap(pcl::PointXYZHSV const *const pi, pcl::PointXYZHSV *const po,
-                        const Eigen::Quaterniond& q_w_curr,
-                        const Eigen::Vector3d& t_w_curr);
+                        const Eigen::Quaterniond& q_world_lidar,
+                        const Eigen::Vector3d& t_world_lidar);
 
+/// Inverse of pointAssociateToMap: moves a world/map-frame point back into
+/// the sensor frame.
 void pointAssociateTobeMapped(PointType const *const pi, PointType *const po,
-                            const Eigen::Quaterniond& q_w_curr,
-                            const Eigen::Vector3d& t_w_curr);
+                            const Eigen::Quaterniond& q_world_lidar,
+                            const Eigen::Vector3d& t_world_lidar);
 
+/// Keeps only the roll and pitch of an IMU orientation (yaw set to zero);
+/// used to constrain the gravity direction while leaving heading free.
 tf2::Quaternion extractRollPitch(Eigen::Quaterniond& imu_rotation);
 
+/// Prints a transform's translation and quaternion to stdout (debugging aid).
 void printTransform(const Transformd& T, const std::string& name);
 
+/// Transforms an Ouster point (with ring/time fields) by the given transform,
+/// copying x/y/z/intensity into the output point type.
 void transformOusterPoints(point_os::OusterPointXYZIRT const *const pi, point_os::PointcloudXYZITR *const po, Transformd &transform);
 
+/// Saves the accumulated cloud to PLY every 10th call (once it has at least
+/// 10 points); returns true only when a file was actually written.
 bool savePly(pcl::PointCloud<PointType>::Ptr pcl_to_save, rclcpp::Node::SharedPtr node);
 
 
 template<typename T>
 inline constexpr T Deg2Rad(const T &deg) { return deg / 180. * M_PI; }
 
+/// Transforms a PCL point in place: p = transform * p (computed in double
+/// precision, stored back as float).
 template<typename PointT>
 inline void TransformPoint(PointT &p, const Transformd &transform) {
     Eigen::Vector3d temp = p.getVector3fMap().template cast<double>();
     p.getVector3fMap() = (transform * temp).template cast<float>();
 }
 
+/// Non-mutating version of TransformPoint: returns the transformed copy.
 template<typename PointT>
 inline PointT TransformPointd(const PointT &p, const Transformd &transform) {
     PointT out(p);
@@ -131,6 +191,7 @@ inline PointT TransformPointd(const PointT &p, const Transformd &transform) {
     return out;
 }
 
+/// Comparator for std::sort that orders (value, index) pairs by descending value.
 inline bool compare_pair_first(const std::pair<float, int> a, const std::pair<float, int> b) // sort from big to small
 {
     return a.first > b.first;

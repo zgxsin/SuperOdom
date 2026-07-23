@@ -10,12 +10,18 @@ namespace super_odometry {
     : Node("imu_preintegration_node", options) {
     }
     
+    // One-time setup: parameters, calibration, topics, and the GTSAM
+    // preintegration settings. Called once after construction.
     void imuPreintegration::initInterface() {
-        //! Callback Groups
+        // A Reentrant callback group lets the IMU callback and the lidar
+        // odometry callback run concurrently on a multi-threaded executor
+        // (they synchronize on the mBuf mutex where needed).
         cb_group_ = create_callback_group(rclcpp::CallbackGroupType::Reentrant);
         rclcpp::SubscriptionOptions sub_options;
         sub_options.callback_group = cb_group_;
 
+        // BEST_EFFORT = do not retry lost messages; for a 200 Hz sensor stream
+        // a fresh sample is more useful than a re-sent old one.
         rclcpp::QoS imu_qos(10);
         imu_qos.best_effort();  // Use BEST_EFFORT reliability
         imu_qos.keep_last(10);  // Keep last 10 messages
@@ -55,7 +61,10 @@ namespace super_odometry {
         pubImuPath = this->create_publisher<nav_msgs::msg::Path>(
             ProjectName+"/imuodom_path", 1);
         
-        // set relevant parameter
+        // Configure how GTSAM integrates IMU measurements.
+        // MakeSharedU("Up") means the world frame has z pointing up and
+        // gravity = (0, 0, -imuGravity). The original converter below attempts
+        // to align incoming measurements with that convention.
         std::shared_ptr<gtsam::PreintegrationParams> p = gtsam::PreintegrationParams::MakeSharedU(config_.imuGravity);
         
         p->accelerometerCovariance =
@@ -84,14 +93,18 @@ namespace super_odometry {
         imuIntegratorImu_ = std::make_shared<gtsam::PreintegratedImuMeasurements>(p, prior_imu_bias); // setting up the IMU integration for IMU message
         imuIntegratorOpt_ = std::make_shared<gtsam::PreintegratedImuMeasurements>(p, prior_imu_bias); // setting up the IMU integration for optimization
 
-        //set extrinsic matrix for laser and imu
+        // The calibration stores T_imu_lidar, which maps lidar-frame points
+        // into the IMU frame. Keep both transform directions available:
+        // T_lidar_imu = inverse(T_imu_lidar).
         if (PROVIDE_IMU_LASER_EXTRINSIC) {
-            lidar2Imu = gtsam::Pose3(gtsam::Rot3(imu_laser_R), gtsam::Point3(imu_laser_T));
+            T_imu_lidar = gtsam::Pose3(
+                gtsam::Rot3(R_imu_lidar), gtsam::Point3(t_imu_lidar));
+            T_lidar_imu = T_imu_lidar.inverse();
         } else {
-            imu2cam = gtsam::Pose3(gtsam::Rot3(imu_camera_R), gtsam::Point3(imu_camera_T));
-            cam2Lidar = gtsam::Pose3(gtsam::Rot3(cam_laser_R), gtsam::Point3(cam_laser_T));
-            imu2Lidar = imu2cam.compose(cam2Lidar);
-            lidar2Imu = imu2Lidar.inverse();
+            T_imu_camera = gtsam::Pose3(gtsam::Rot3(R_imu_camera), gtsam::Point3(t_imu_camera));
+            T_camera_lidar = gtsam::Pose3(gtsam::Rot3(R_camera_lidar), gtsam::Point3(t_camera_lidar));
+            T_imu_lidar = T_imu_camera.compose(T_camera_lidar);
+            T_lidar_imu = T_imu_lidar.inverse();
         }
 
     }
@@ -139,8 +152,11 @@ namespace super_odometry {
 
     }
 
+    // Throws away the optimizer and starts an empty factor graph.
     void imuPreintegration::resetOptimization() {
         gtsam::ISAM2Params optParameters;
+        // Relinearize a variable when its update exceeds 0.1, and check at
+        // every update. Keeps the (nonlinear) solution accurate as it evolves.
         optParameters.relinearizeThreshold = 0.1;
         optParameters.relinearizeSkip = 1;
         optimizer = gtsam::ISAM2(optParameters);
@@ -152,6 +168,8 @@ namespace super_odometry {
         graphValues = NewGraphValues;
     }
 
+    // Called after a failure: forces the next lidar pose to re-initialize the
+    // whole system (see laserodometryHandler).
     void imuPreintegration::resetParams() {
         lastImuT_imu = -1;
         doneFirstOpt = false;
@@ -159,6 +177,11 @@ namespace super_odometry {
     }
 
 
+    // Periodic "restart" that keeps the graph from growing forever (called
+    // every 100 keyframes). The trick: ask the old optimizer how uncertain the
+    // latest state is (marginal covariance), then start a brand-new graph
+    // whose priors are that state with that uncertainty. Nothing is lost, but
+    // the graph is small again.
     void imuPreintegration::reset_graph() {
 
         // get updated noise before reset
@@ -180,8 +203,9 @@ namespace super_odometry {
 
         // reset graph
         resetOptimization();
+        // Re-seed the new graph at index 0 with the carried-over state.
         // add pose
-        gtsam::PriorFactor<gtsam::Pose3> priorPose(X(0), prevPose_,
+        gtsam::PriorFactor<gtsam::Pose3> priorPose(X(0), T_world_imu_prev,
                                                    updatedPoseNoise);
         graphFactors.add(priorPose);
         // add velocity
@@ -192,8 +216,8 @@ namespace super_odometry {
         gtsam::PriorFactor<gtsam::imuBias::ConstantBias> priorBias(
                 B(0), prevBias_, updatedBiasNoise);
         graphFactors.add(priorBias);
-        // add values
-        graphValues.insert(X(0), prevPose_);
+        // add values (initial guesses for the unknowns = the carried-over state)
+        graphValues.insert(X(0), T_world_imu_prev);
         graphValues.insert(V(0), prevVel_);
         graphValues.insert(B(0), prevBias_);
         // optimize once
@@ -204,9 +228,16 @@ namespace super_odometry {
         key = 1;
     }
 
-    void imuPreintegration::initial_system(double currentCorrectionTime, gtsam::Pose3 lidarPose) {
+    // Called on the FIRST lidar pose (or after a reset). Anchors the factor
+    // graph: pose comes from lidar odometry, velocity is assumed zero, and
+    // bias is assumed zero (the priors' sigmas say how much those assumptions
+    // may be bent by later measurements).
+    void imuPreintegration::initial_system(
+        double currentCorrectionTime, gtsam::Pose3 T_world_lidar_meas) {
         resetOptimization();
 
+        // Drop IMU samples older than the first lidar pose; they predate the
+        // state we are anchoring and can never be used.
         while (!imuQueOpt.empty()) {
             if (secs(&imuQueOpt.front()) < currentCorrectionTime - delta_t) {
                 lastImuT_opt = secs(&imuQueOpt.front());
@@ -216,23 +247,29 @@ namespace super_odometry {
                 break;
         }
 
-        prevPose_ = lidarPose.compose(lidar2Imu);
+        // The graph estimates the IMU pose, but lidar odometry measures the
+        // lidar pose -> convert using the extrinsic.
+        // T_world_imu = T_world_lidar * T_lidar_imu.
+        T_world_imu_prev = T_world_lidar_meas.compose(T_lidar_imu);
 
-        gtsam::PriorFactor<gtsam::Pose3> priorPose(X(0), prevPose_,
+        gtsam::PriorFactor<gtsam::Pose3> priorPose(X(0), T_world_imu_prev,
                                                    priorPoseNoise);
         graphFactors.add(priorPose);
 
+        // Assume the robot starts (approximately) at rest.
         prevVel_ = gtsam::Vector3(0, 0, 0);
         gtsam::PriorFactor<gtsam::Vector3> priorVel(V(0), prevVel_,
                                                     priorVelNoise);
         graphFactors.add(priorVel);
 
+        // Assume zero initial IMU bias; the optimizer will estimate the real
+        // value over time via the bias random-walk factors.
         prevBias_ = gtsam::imuBias::ConstantBias();
         gtsam::PriorFactor<gtsam::imuBias::ConstantBias> priorBias(
                 B(0), prevBias_, priorBiasNoise);
         graphFactors.add(priorBias);
 
-        graphValues.insert(X(0), prevPose_);
+        graphValues.insert(X(0), T_world_imu_prev);
         graphValues.insert(V(0), prevVel_);
         graphValues.insert(B(0), prevBias_);
 
@@ -240,6 +277,7 @@ namespace super_odometry {
         graphFactors.resize(0);
         graphValues.clear();
 
+        // Both preintegrators start fresh with the (zero) initial bias.
         imuIntegratorImu_->resetIntegrationAndSetBias(prevBias_);
         imuIntegratorOpt_->resetIntegrationAndSetBias(prevBias_);
 
@@ -247,6 +285,10 @@ namespace super_odometry {
         systemInitialized = true;
     }
 
+    // Feeds every buffered IMU sample older than the new lidar pose into
+    // imuIntegratorOpt_. GTSAM accumulates them into a single relative
+    // motion (delta position/velocity/rotation) that will become one
+    // ImuFactor connecting the previous keyframe to the new one.
     void imuPreintegration::integrate_imumeasurement(double currentCorrectionTime) {
         // 1. integrate imu data and optimize
 
@@ -257,9 +299,12 @@ namespace super_odometry {
             double imuTime = secs(thisImu);
             if (imuTime < currentCorrectionTime - delta_t)
             {
+                // dt = time since the previous integrated sample. For the very
+                // first sample there is no previous one, so assume 200 Hz.
                 double dt = (lastImuT_opt < 0) ? (1.0 / 200.0) : (imuTime - lastImuT_opt);
                 lastImuT_opt = imuTime;
 
+                // Guard against garbage timestamps (duplicates or gaps).
                 if(dt < 0.001 || dt > 0.5) 
                     dt = 0.005;
                
@@ -270,46 +315,63 @@ namespace super_odometry {
                 imuQueOpt.pop_front();
             }
             else
-                break;
+                break;  // queue is time-ordered; the rest is newer than the lidar pose
         }
 
     }
 
 
-    bool imuPreintegration::build_graph(gtsam::Pose3 lidarPose, double curLaserodomtimestamp) {
+    // Adds one keyframe to the factor graph and solves it. Three factors are
+    // added per keyframe:
+    //   1. a prior on X(key) from the lidar pose ("the lidar says you are here"),
+    //   2. an ImuFactor connecting keyframe key-1 to key ("the IMU says you
+    //      moved this much in between"),
+    //   3. a bias between-factor allowing the bias to drift slowly.
+    // The optimizer balances (1) and (2); their disagreement is what makes
+    // the bias observable.
+    bool imuPreintegration::build_graph(
+        gtsam::Pose3 T_world_lidar_meas, double curLaserodomtimestamp) {
 
 
-        // add laser pose prior factor
+        // Convert the measured lidar pose to the IMU pose that the graph estimates.
+        gtsam::Pose3 T_world_imu_meas = T_world_lidar_meas.compose(T_lidar_imu);
 
-        gtsam::Pose3 curPose = lidarPose.compose(lidar2Imu);
-
-        // insert predicted values
+        // Predict where the IMU thinks we are now, by applying the
+        // preintegrated motion to the previous optimized state. Used as the
+        // initial guess for the new unknowns.
         gtsam::NavState propState_ =
                 imuIntegratorOpt_->predict(prevState_, prevBias_);
-        auto diff  = curPose.translation() - propState_.pose().translation();
+        auto diff = T_world_imu_meas.translation() - propState_.pose().translation();
 
-        gtsam::PriorFactor<gtsam::Pose3> pose_factor(X(key), curPose,
+        // (1) lidar pose prior factor
+        gtsam::PriorFactor<gtsam::Pose3> pose_factor(X(key), T_world_imu_meas,
                                                      correctionNoise);
         graphFactors.add(pose_factor);
-                // add imu factor to graph
-        
+
+        // (2) IMU preintegration factor: constrains pose+velocity at key-1 and
+        // key, given the bias at key-1.
         const gtsam::PreintegratedImuMeasurements &preint_imu =
                 dynamic_cast<const gtsam::PreintegratedImuMeasurements &>(
                         *imuIntegratorOpt_);
         gtsam::ImuFactor imu_factor(X(key - 1), V(key - 1), X(key), V(key),
                                     B(key - 1), preint_imu);
         graphFactors.add(imu_factor);
-        // add imu bias between factor
+
+        // (3) bias random-walk factor: bias(key) should equal bias(key-1) up
+        // to noise that grows with the elapsed time deltaTij.
         graphFactors.add(gtsam::BetweenFactor<gtsam::imuBias::ConstantBias>(
                 B(key - 1), B(key), gtsam::imuBias::ConstantBias(),
                 gtsam::noiseModel::Diagonal::Sigmas(
                         sqrt(imuIntegratorOpt_->deltaTij()) * noiseModelBetweenBias)));
+
+        // Initial guesses for the new unknowns (IMU prediction + old bias).
         graphValues.insert(X(key), propState_.pose());
         graphValues.insert(V(key), propState_.v());
         graphValues.insert(B(key), prevBias_);
         
   
-        // optimize
+        // Run the incremental solver. The second update() call performs an
+        // extra relinearization pass to refine the solution.
         bool systemSolvedSuccessfully = false;
         try {
             optimizer.update(graphFactors, graphValues);
@@ -321,25 +383,33 @@ namespace super_odometry {
             RCLCPP_WARN(this->get_logger(), "Update failed due to underconstrained call to isam2 in imuPreintegration");
         }
 
+        // ISAM2 keeps the factors internally; clear our staging containers.
         graphFactors.resize(0);
         graphValues.clear();
 
         if (systemSolvedSuccessfully) {
-
+            // Store the new optimum, and reset the preintegrator with the
+            // refined bias so the next inter-keyframe integration is cleaner.
             gtsam::Values result = optimizer.calculateEstimate();
-            prevPose_ = result.at<gtsam::Pose3>(X(key));
+            T_world_imu_prev = result.at<gtsam::Pose3>(X(key));
             prevVel_ = result.at<gtsam::Vector3>(V(key));
-            prevState_ = gtsam::NavState(prevPose_, prevVel_);
+            prevState_ = gtsam::NavState(T_world_imu_prev, prevVel_);
             prevBias_ = result.at<gtsam::imuBias::ConstantBias>(B(key));
             imuIntegratorOpt_->resetIntegrationAndSetBias(prevBias_);
         }        
         return systemSolvedSuccessfully;
     }
 
+    // The IMU-rate odometry published in imuHandler is always "last optimized
+    // state + everything the IMU measured since". After each optimization the
+    // starting point changed, so we must redo that sum: snapshot the new
+    // state/bias, drop IMU samples older than the lidar pose, and re-integrate
+    // the remaining (newer) samples with the refined bias.
     void imuPreintegration::repropagate_imuodometry(double currentCorrectionTime) {
         prevStateOdom = prevState_;
         prevBiasOdom = prevBias_;
 
+        // Discard samples already covered by the optimization.
         double lastImuQT = -1;
         while (!imuQueImu.empty() && secs(&imuQueImu.front()) < currentCorrectionTime - delta_t) {
             lastImuQT = secs(&imuQueImu.front());
@@ -347,6 +417,8 @@ namespace super_odometry {
         }
 
         if (!imuQueImu.empty()) {
+            // Restart the high-rate integrator from zero with the new bias and
+            // replay the remaining samples.
             imuIntegratorImu_->resetIntegrationAndSetBias(prevBiasOdom);
             for (int i = 0; i < (int)imuQueImu.size(); ++i) {
                 sensor_msgs::msg::Imu *thisImu = &imuQueImu[i];
@@ -366,35 +438,45 @@ namespace super_odometry {
         }
     }
 
-    void imuPreintegration::process_imu_odometry(double currentCorrectionTime, gtsam::Pose3 relativePose) {
+    // The per-lidar-pose pipeline, in order. Called from laserodometryHandler
+    // for every lidar pose after the system is initialized.
+    void imuPreintegration::process_imu_odometry(
+        double currentCorrectionTime, gtsam::Pose3 T_world_lidar_meas) {
 
-        // reset graph for speed
+        // Keep the factor graph small: every 100 keyframes, carry the current
+        // estimate over into a fresh graph (see reset_graph()).
         if (key > 100) {
             reset_graph();
         }
 
-        // 1. integrate_imumeasurement
+        // 1. Sum the IMU samples between the previous and this lidar pose.
         integrate_imumeasurement(currentCorrectionTime);
 
-        lidarodom_w_cur = relativePose;
+        this->T_world_lidar_meas = T_world_lidar_meas;
 
-        // 2. build_graph
-        bool successOptimization = build_graph(lidarodom_w_cur, currentCorrectionTime);
+        // 2. Add this keyframe's factors and run the optimizer.
+        bool successOptimization =
+            build_graph(this->T_world_lidar_meas, currentCorrectionTime);
         
-        // 3. check optimization
+        // 3. If the optimizer failed or produced a physically absurd result,
+        //    force a full re-initialization on the next lidar pose.
         if (failureDetection(prevVel_, prevBias_) || !successOptimization) {
             RCLCPP_WARN(this->get_logger(), "failureDetected");
             resetParams();
             return;
         }
 
-        // 4. reprogate_imuodometry
+        // 4. Rebase the high-rate IMU odometry onto the new optimum.
         repropagate_imuodometry(currentCorrectionTime);
         ++key;
 
+        // From now on imuHandler may publish IMU-rate odometry.
         doneFirstOpt = true;
     }
 
+    // Plausibility check on the optimized result. Thresholds are generous:
+    // 30 m/s velocity, 2 m/s^2 accel bias, 1 rad/s gyro bias — real values
+    // beyond these almost certainly mean the estimate diverged.
     bool imuPreintegration::failureDetection(const gtsam::Vector3 &velCur,
                                              const gtsam::imuBias::ConstantBias &biasCur) {
         Eigen::Vector3f vel(velCur.x(), velCur.y(), velCur.z());
@@ -416,15 +498,21 @@ namespace super_odometry {
         return false;
     }
 
+    // Callback for each lidar odometry pose (~10 Hz). This is where the
+    // actual sensor fusion happens: initialize on the first pose, then for
+    // every later pose run the integrate -> optimize -> re-propagate pipeline
+    // and finally check the health of the IMU stream.
     void imuPreintegration::laserodometryHandler(const nav_msgs::msg::Odometry::SharedPtr odomMsg) {
         std::lock_guard<std::mutex> lock(mBuf);
 
         cur_frame = odomMsg;
         double lidarOdomTime = secs(odomMsg);
 
+        // Without IMU data there is nothing to fuse yet.
         if (imuQueOpt.empty())
             return;
 
+        // Unpack the lidar pose into a gtsam::Pose3.
         float p_x = odomMsg->pose.pose.position.x;
         float p_y = odomMsg->pose.pose.position.y;
         float p_z = odomMsg->pose.pose.position.z;
@@ -432,26 +520,30 @@ namespace super_odometry {
         float r_y = odomMsg->pose.pose.orientation.y;
         float r_z = odomMsg->pose.pose.orientation.z;
         float r_w = odomMsg->pose.pose.orientation.w;
-        gtsam::Pose3 lidarPose = gtsam::Pose3(gtsam::Rot3::Quaternion(r_w, r_x, r_y, r_z),
-                                              gtsam::Point3(p_x, p_y, p_z));
+        gtsam::Pose3 T_world_lidar_meas(
+            gtsam::Rot3::Quaternion(r_w, r_x, r_y, r_z),
+            gtsam::Point3(p_x, p_y, p_z));
 
         // 0. initialize system
         if (systemInitialized == false) {
-            initial_system(lidarOdomTime, lidarPose);
+            initial_system(lidarOdomTime, T_world_lidar_meas);
             return;
         }
 
         TicToc Optimization_time;
         //1. process imu odometry
-        process_imu_odometry(lidarOdomTime, lidarPose);
+        process_imu_odometry(lidarOdomTime, T_world_lidar_meas);
 
-        // 2. safe landing process
+        // 2. Health check: if the newest IMU sample is much older than this
+        // lidar pose, the IMU stream has stalled (driver/hardware problem).
         double latest_imu_time = secs(&imuQueImu.back());
 
         if (lidarOdomTime - latest_imu_time < imu_laser_timedelay) {
             RESULT = IMU_STATE::SUCCESS;
             health_status = true;
           
+            // The lidar odometry node signals its own failure through
+            // covariance[0]; propagate it.
             if((int)odomMsg->pose.covariance[0] == 1) {
                 RESULT = IMU_STATE::FAIL;
             }
@@ -482,86 +574,106 @@ namespace super_odometry {
         last_frame = cur_frame;
         last_processed_lidar_time = lidarOdomTime;
     }
-    //TODO: need to consider the extrinsic matrix of imu and lidar
+    // Preserves the original conversion behavior. It applies the initial
+    // gravity/lidar rotation to gyro and acceleration, adds a lever-arm
+    // correction, and post-multiplies orientation by the same rotation.
+    // WARNING: R_gravity_lidar_initial maps lidar vectors into the initial
+    // gravity frame, while the inputs below are raw IMU-frame measurements.
+    // The frames are therefore inconsistent for non-identity extrinsics.
     sensor_msgs::msg::Imu imuPreintegration::imuConverter(const sensor_msgs::msg::Imu &imu_in) {
         sensor_msgs::msg::Imu imu_out = imu_in;
-        
-        Eigen::Matrix3d imu_laser_R_Gravity;
-        imu_laser_R_Gravity=imu_Init->imu_laser_R_Gravity;
+        // This rotation maps data in lidar frame to the initial gravity frame at the same origin.
+        Eigen::Matrix3d R_gravity_lidar_initial =
+            imu_Init->R_gravity_lidar_initial;
 
-        Eigen::Vector3d rpy;
-        rpy=imu_Init->rotationMatrixToRPY(imu_laser_R_Gravity);
- 
-        // rotate gyro and acc only when sensor is livox
-        // rotate gyroscope
-        Eigen::Vector3d gyr(imu_in.angular_velocity.x, imu_in.angular_velocity.y,
-                            imu_in.angular_velocity.z);
-        gyr=imu_laser_R_Gravity*gyr;
-        imu_out.angular_velocity.x = gyr.x();
-        imu_out.angular_velocity.y = gyr.y();
-        imu_out.angular_velocity.z = gyr.z();
+        // Retained for exact compatibility with the original implementation;
+        // this value is calculated but not otherwise used.
+        Eigen::Vector3d rpy_gravity_lidar_initial =
+            imu_Init->rotationMatrixToRPY(R_gravity_lidar_initial);
 
+        Eigen::Vector3d gyr_gravity_lidar(
+            imu_in.angular_velocity.x, imu_in.angular_velocity.y,
+            imu_in.angular_velocity.z);
+        gyr_gravity_lidar =
+            R_gravity_lidar_initial * gyr_gravity_lidar;
+        imu_out.angular_velocity.x = gyr_gravity_lidar.x();
+        imu_out.angular_velocity.y = gyr_gravity_lidar.y();
+        imu_out.angular_velocity.z = gyr_gravity_lidar.z();
 
-        // rotate acceleration
-        Eigen::Vector3d acc(imu_in.linear_acceleration.x,
-                            imu_in.linear_acceleration.y,
-                            imu_in.linear_acceleration.z);
+        Eigen::Vector3d acc_gravity_lidar(
+            imu_in.linear_acceleration.x, imu_in.linear_acceleration.y,
+            imu_in.linear_acceleration.z);
+        acc_gravity_lidar =
+            R_gravity_lidar_initial * acc_gravity_lidar;
 
-        acc=imu_laser_R_Gravity*acc;
-        acc = acc + ((gyr - gyr_pre) * 200).cross(- imu_laser_T) + gyr.cross(gyr.cross(-imu_laser_T));
-        imu_out.linear_acceleration.x = acc.x();
-        imu_out.linear_acceleration.y = acc.y();
-        imu_out.linear_acceleration.z = acc.z();
+        // Original lever-arm correction. WARNING:
+        // - 200 hardcodes a 200 Hz sample rate.
+        // - gyr_gravity_lidar_prev is not initialized before the first call.
+        // - t_imu_lidar is expressed in IMU axes, unlike the rotated vectors.
+        acc_gravity_lidar =
+            acc_gravity_lidar
+            + ((gyr_gravity_lidar - gyr_gravity_lidar_prev) * 200)
+                  .cross(-t_imu_lidar)
+            + gyr_gravity_lidar.cross(
+                  gyr_gravity_lidar.cross(-t_imu_lidar));
+        imu_out.linear_acceleration.x = acc_gravity_lidar.x();
+        imu_out.linear_acceleration.y = acc_gravity_lidar.y();
+        imu_out.linear_acceleration.z = acc_gravity_lidar.z();
 
+        Eigen::Quaterniond q_world_imu(
+            imu_in.orientation.w, imu_in.orientation.x,
+            imu_in.orientation.y, imu_in.orientation.z);
+        // WARNING: normalizing a zero/invalid driver quaternion can produce NaN.
+        q_world_imu.normalize();
 
-        // rotate roll pitch yaw
-        Eigen::Quaterniond q(imu_in.orientation.w, imu_in.orientation.x,
-                             imu_in.orientation.y, imu_in.orientation.z);
+        Eigen::Quaterniond q_gravity_lidar_initial(
+            R_gravity_lidar_initial);
+        Eigen::Quaterniond q_world_lidar_gravity_aligned =
+            q_world_imu * q_gravity_lidar_initial;
+        q_world_lidar_gravity_aligned.normalize();
 
-        q.normalize();
+        imu_out.orientation.x = q_world_lidar_gravity_aligned.x();
+        imu_out.orientation.y = q_world_lidar_gravity_aligned.y();
+        imu_out.orientation.z = q_world_lidar_gravity_aligned.z();
+        imu_out.orientation.w = q_world_lidar_gravity_aligned.w();
 
-
-        Eigen::Quaterniond q_extrinsic;
-        q_extrinsic=Eigen::Quaterniond(imu_laser_R_Gravity);
-
-        Eigen::Quaterniond q_new;
-
-        q_new=q*q_extrinsic;
-
-        q_new.normalize();
-
-        imu_out.orientation.x = q_new.x();
-        imu_out.orientation.y = q_new.y();
-        imu_out.orientation.z = q_new.z();
-        imu_out.orientation.w = q_new.w();
-
-        gyr_pre = gyr;
+        gyr_gravity_lidar_prev = gyr_gravity_lidar;
 
         return imu_out;
     }
 
 
+   // Callback for each raw IMU message (~200 Hz). Note that the heavy
+   // math (optimization) happens in laserodometryHandler; this callback only
+   // converts, buffers, and predicts.
    void imuPreintegration::imuHandler(const sensor_msgs::msg::Imu::SharedPtr imu_raw) {
     std::lock_guard<std::mutex> lock(mBuf);
     
-    // 1. Pre-process IMU data
+    // 1. Apply the original IMU conversion described above.
     sensor_msgs::msg::Imu thisImu = imuConverter(*imu_raw);
-    assert(imu_raw->linear_acceleration.x != thisImu.linear_acceleration.x);
+    // WARNING: this is not a reliable validation check: a valid conversion can
+    // leave the x component unchanged and trigger this assertion.
+    assert(imu_raw->linear_acceleration.x !=
+           thisImu.linear_acceleration.x);
 
-    // 2. Handle IMU initialization for LIVOX sensor
+    // 2. During the first ~1 s, only collect data for the one-time IMU
+    //    initialization (bias/gravity/leveling); nothing else can run yet.
     if (!handleIMUInitialization(imu_raw, thisImu)) {
         return;
     }
 
-    // 3. Process timing and queue management
+    // 3. Push the converted sample into both queues (for optimization and
+    //    for high-rate propagation).
     processTiming(thisImu);
 
-    // 4. Early return if first optimization not done
+    // 4. Until the first graph optimization there is no state to propagate from.
     if (!doneFirstOpt) {
         return;
     }
 
-    // 5. Prepare and publish odometry
+    // 5. Predict the current state = last optimized state + preintegrated
+    //    IMU motion since then, and publish it. This is the "high-rate
+    //    odometry" output of this node.
     gtsam::NavState currentState =imuIntegratorImu_->predict(prevStateOdom, prevBiasOdom);
     nav_msgs::msg::Odometry odometry;
     publishOdometry(thisImu, currentState, odometry);
@@ -569,6 +681,9 @@ namespace super_odometry {
    
    }
 
+   // Gate for the one-time IMU initialization. Returns false (blocking the
+   // rest of imuHandler) until Imu::imuInit() has run. Also applies the Livox
+   // unit fix on every message, since Livox reports acceleration in g.
    bool imuPreintegration::handleIMUInitialization(const sensor_msgs::msg::Imu::SharedPtr&imu_raw, 
    sensor_msgs::msg::Imu& thisImu) {   
 
@@ -584,6 +699,10 @@ namespace super_odometry {
 
    }
 
+   // Collects raw IMU samples into imuBuf; once 1 s of data has accumulated,
+   // Imu::imuInit() estimates the gyro/accel biases, gravity direction and the
+   // initial leveling rotation used by the lidar front end.
+   // The robot should be stationary during this window.
    void imuPreintegration::initializeImu(const sensor_msgs::msg::Imu::SharedPtr& imu_raw) {
     Imu::Ptr imudata = std::make_shared<Imu>();
     imudata->time = imu_raw->header.stamp.sec + imu_raw->header.stamp.nanosec * 1e-9;
@@ -593,10 +712,10 @@ namespace super_odometry {
     imudata->gyr = Eigen::Vector3d(imu_raw->angular_velocity.x,
                                   imu_raw->angular_velocity.y,
                                   imu_raw->angular_velocity.z);
-    imudata->q_w_i = Eigen::Quaterniond(imu_raw->orientation.w,
-                                       imu_raw->orientation.x,
-                                       imu_raw->orientation.y,
-                                       imu_raw->orientation.z);
+    imudata->q_world_imu = Eigen::Quaterniond(imu_raw->orientation.w,
+                                             imu_raw->orientation.x,
+                                             imu_raw->orientation.y,
+                                             imu_raw->orientation.z);
 
     imuBuf.addMeas(imudata, imudata->time);
 
@@ -612,6 +731,9 @@ namespace super_odometry {
 }
 
 
+// Livox IMUs report acceleration in units of g (a static sensor reads norm
+// ~1.0 instead of ~9.81 m/s^2). Rescale using the stationary mean measured
+// during initialization so a static sensor reads exactly 'gravity'.
 void imuPreintegration::correctLivoxGravity(sensor_msgs::msg::Imu& thisImu) {
     const double gravity = 9.8105;
     Eigen::Vector3d acc(thisImu.linear_acceleration.x,
@@ -624,6 +746,9 @@ void imuPreintegration::correctLivoxGravity(sensor_msgs::msg::Imu& thisImu) {
 }
 
 
+// Updates the last-IMU-timestamp bookkeeping and appends the converted sample
+// to both queues: imuQueOpt (consumed by the optimizer between lidar poses)
+// and imuQueImu (used for high-rate propagation past the last lidar pose).
 void imuPreintegration::processTiming(const sensor_msgs::msg::Imu& thisImu) {
     double imuTime = secs(&thisImu);
     double dt = (lastImuT_imu < 0) ? (1.0 / 200.0) : (imuTime - lastImuT_imu);
@@ -645,6 +770,7 @@ void imuPreintegration::publishOdometry(
     
     prepareOdometryMessage(odometry, thisImu, currentState);
     
+    // Decimate: publish every 4th IMU sample (e.g. 200 Hz -> 50 Hz).
     if (frame_count++ % 4 == 0) {
         pubImuOdometry->publish(odometry);
     }
@@ -666,25 +792,29 @@ void imuPreintegration::publishTransform(nav_msgs::msg::Odometry &odometry, cons
     
     tf2_ros::TransformBroadcaster br(this);
     geometry_msgs::msg::TransformStamped transform_stamped_;
-    tf2::Transform transform;
+    tf2::Transform T_world_sensor_tf;
     transform_stamped_.header.stamp  = thisImu.header.stamp;
     transform_stamped_.header.frame_id = WORLD_FRAME;
     transform_stamped_.child_frame_id = SENSOR_FRAME;
     
-    tf2::Quaternion q;
-    transform.setOrigin(tf2::Vector3(odometry.pose.pose.position.x, 
-    odometry.pose.pose.position.y, odometry.pose.pose.position.z));
+    tf2::Quaternion q_world_sensor;
+    T_world_sensor_tf.setOrigin(tf2::Vector3(
+        odometry.pose.pose.position.x,
+        odometry.pose.pose.position.y,
+        odometry.pose.pose.position.z));
 
-    q.setW(odometry.pose.pose.orientation.w);
-    q.setX(odometry.pose.pose.orientation.x);
-    q.setY(odometry.pose.pose.orientation.y);
-    q.setZ(odometry.pose.pose.orientation.z);
-    transform.setRotation(q);
-    transform_stamped_.transform = tf2::toMsg(transform);
+    q_world_sensor.setW(odometry.pose.pose.orientation.w);
+    q_world_sensor.setX(odometry.pose.pose.orientation.x);
+    q_world_sensor.setY(odometry.pose.pose.orientation.y);
+    q_world_sensor.setZ(odometry.pose.pose.orientation.z);
+    T_world_sensor_tf.setRotation(q_world_sensor);
+    transform_stamped_.transform = tf2::toMsg(T_world_sensor_tf);
     if(frame_count%4==0)
         br.sendTransform(transform_stamped_);
 }
 
+// Maintains a short visualization path: one pose every 0.1 s, keeping only
+// the last 3 s, published when someone (e.g. RViz) is subscribed.
 void imuPreintegration::updateAndPublishPath(nav_msgs::msg::Odometry &odometry, const sensor_msgs::msg::Imu& thisImu){
     static nav_msgs::msg::Path imuPath;
     static double last_path_time = -1;
@@ -710,51 +840,76 @@ void imuPreintegration::updateAndPublishPath(nav_msgs::msg::Odometry &odometry, 
     }
 }
 
+// Converts the predicted NavState (which is the IMU pose in the world frame)
+// into the odometry message consumers expect: lidar pose in the world frame,
+// body-frame velocity, bias-corrected angular rate, plus health/bias values
+// smuggled into the covariance array.
 void imuPreintegration::prepareOdometryMessage( nav_msgs::msg::Odometry &odometry, 
 const sensor_msgs::msg::Imu &thisImu, const gtsam::NavState &currentState){
     
-    Eigen::Quaterniond q_w_curr;    
+    // Orientation source: either the IMU driver's own attitude filter
+    // (use_imu_roll_pitch) or the optimized/predicted state.
+    Eigen::Quaterniond q_world_imu;
     if (config_.use_imu_roll_pitch) {
-        q_w_curr = Eigen::Quaterniond(thisImu.orientation.w, thisImu.orientation.x, thisImu.orientation.y, thisImu.orientation.z);
+        q_world_imu = Eigen::Quaterniond(
+            thisImu.orientation.w, thisImu.orientation.x,
+            thisImu.orientation.y, thisImu.orientation.z);
     } else {
-        q_w_curr = Eigen::Quaterniond(currentState.quaternion().w(), currentState.quaternion().x(),
-                                      currentState.quaternion().y(), currentState.quaternion().z());
+        q_world_imu = Eigen::Quaterniond(
+            currentState.quaternion().w(), currentState.quaternion().x(),
+            currentState.quaternion().y(), currentState.quaternion().z());
     }
 
-    gtsam::Rot3 imuRot(q_w_curr);
-    gtsam::Pose3 imuPose = gtsam::Pose3(imuRot, currentState.position());
-    gtsam::Pose3 lidarPoseOpt = imuPose.compose(imu2Lidar);
+    // The state refers to the IMU; convert to the lidar pose via the extrinsic.
+    gtsam::Rot3 R_world_imu(q_world_imu);
+    gtsam::Pose3 T_world_imu(R_world_imu, currentState.position());
+    gtsam::Pose3 T_world_lidar = T_world_imu.compose(T_imu_lidar);
 
-    Eigen::Vector3d velocity_w_curr(currentState.velocity().x(), currentState.velocity().y(),
-                                    currentState.velocity().z());
-    Eigen::Vector3d velocity_curr = currentState.quaternion().inverse() * velocity_w_curr;
+    // Velocity is estimated in the world frame; rotate it into the body frame
+    // for the twist field (ROS convention: twist is in child_frame_id).
+    Eigen::Vector3d velocity_world_current(
+        currentState.velocity().x(), currentState.velocity().y(),
+        currentState.velocity().z());
+    Eigen::Vector3d velocity_imu_current =
+        currentState.quaternion().inverse() * velocity_world_current;
     
     
     odometry.header.stamp = thisImu.header.stamp;
     odometry.header.frame_id = WORLD_FRAME;
     odometry.child_frame_id = SENSOR_FRAME;
     
-    Eigen::Quaterniond q_w_lidar(lidarPoseOpt.rotation().toQuaternion().w(), lidarPoseOpt.rotation().toQuaternion().x(),
-                                    lidarPoseOpt.rotation().toQuaternion().y(), lidarPoseOpt.rotation().toQuaternion().z());
-    q_w_lidar.normalized();
+    Eigen::Quaterniond q_world_lidar(
+        T_world_lidar.rotation().toQuaternion().w(),
+        T_world_lidar.rotation().toQuaternion().x(),
+        T_world_lidar.rotation().toQuaternion().y(),
+        T_world_lidar.rotation().toQuaternion().z());
+    // WARNING: normalized() returns a new quaternion; because the return value
+    // is discarded, this original call does not normalize q_world_lidar.
+    q_world_lidar.normalized();
 
-    odometry.pose.pose.position.x = lidarPoseOpt.translation().x();
-    odometry.pose.pose.position.y = lidarPoseOpt.translation().y();
-    odometry.pose.pose.position.z = lidarPoseOpt.translation().z();
-    odometry.pose.pose.orientation.x = q_w_lidar.x();
-    odometry.pose.pose.orientation.y = q_w_lidar.y();
-    odometry.pose.pose.orientation.z = q_w_lidar.z();
-    odometry.pose.pose.orientation.w = q_w_lidar.w();
+    odometry.pose.pose.position.x = T_world_lidar.translation().x();
+    odometry.pose.pose.position.y = T_world_lidar.translation().y();
+    odometry.pose.pose.position.z = T_world_lidar.translation().z();
+    odometry.pose.pose.orientation.x = q_world_lidar.x();
+    odometry.pose.pose.orientation.y = q_world_lidar.y();
+    odometry.pose.pose.orientation.z = q_world_lidar.z();
+    odometry.pose.pose.orientation.w = q_world_lidar.w();
 
-    odometry.twist.twist.linear.x = velocity_curr.x();
-    odometry.twist.twist.linear.y = velocity_curr.y();;
-    odometry.twist.twist.linear.z = velocity_curr.z();;
+    odometry.twist.twist.linear.x = velocity_imu_current.x();
+    odometry.twist.twist.linear.y = velocity_imu_current.y();;
+    odometry.twist.twist.linear.z = velocity_imu_current.z();;
+    // Angular rate = raw gyro corrected by the estimated gyro bias.
     odometry.twist.twist.angular.x =
             thisImu.angular_velocity.x + prevBiasOdom.gyroscope().x();
     odometry.twist.twist.angular.y =
             thisImu.angular_velocity.y + prevBiasOdom.gyroscope().y();
     odometry.twist.twist.angular.z =
             thisImu.angular_velocity.z + prevBiasOdom.gyroscope().z();
+
+    // The covariance array is repurposed as a side channel:
+    // [0] = IMU health state (IMU_STATE enum), [1..3] = accel bias,
+    // [4..6] = gyro bias, [7] = gravity magnitude. Downstream nodes read
+    // these instead of a real covariance.
     odometry.pose.covariance[0] = double(RESULT);
 
     odometry.pose.covariance[1] = prevBiasOdom.accelerometer().x();

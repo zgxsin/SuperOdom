@@ -1,15 +1,44 @@
 //
 // Created by shiboz on 2021-10-18.
 //
+// ============================================================================
+// OVERVIEW
+// ============================================================================
+// Implementation of the laserMapping node (see laserMapping.h for the big
+// picture). The per-scan flow, driven by the process() loop, is:
+//
+//   laserFeatureInfoHandler   buffer the feature message (callback thread)
+//   process()                 main loop (timer thread):
+//     extractSensorData()       pop one synchronized scan bundle
+//     setInitialGuess()         predict the pose at scan time
+//     adjustVoxelSize()         downsample features (adaptive voxel size)
+//     performSLAMOptimization() scan-to-map registration via LidarSLAM/Ceres
+//     updatePoseAndPublish()    accept the refined pose, publish topics
+//
+// "Scan-to-map registration" means: given a predicted pose, transform each
+// feature point into the world frame, find its closest line/plane in the
+// local map, and adjust the pose so the summed point-to-line and
+// point-to-plane distances are minimal. That refined pose is the lidar
+// odometry output.
+// ============================================================================
 
 #include "super_odometry/LaserMapping/laserMapping.h"
 
+// The pose being optimized, stored in the memory layout Ceres expects:
+// parameters = [tx, ty, tz, qx, qy, qz, qw]. The two Eigen::Map objects are
+// views into this same array, so writing q_world_lidar / t_world_lidar updates the
+// parameter block and vice versa. This is the lidar pose in the world frame.
+namespace {
 double parameters[7] = {0, 0, 0, 0, 0, 0, 1};
-Eigen::Map<Eigen::Vector3d> t_w_curr(parameters);
-Eigen::Map<Eigen::Quaterniond> q_w_curr(parameters+3);
+Eigen::Map<Eigen::Vector3d> t_world_lidar(parameters);
+Eigen::Map<Eigen::Quaterniond> q_world_lidar(parameters+3);
 
+// Body-frame linear and angular velocity of the latest scan, computed by
+// finite-differencing consecutive optimized poses (filled in
+// updatePoseAndPublish, published in the odometry twist).
 Eigen::Vector3d vel_b;
 Eigen::Vector3d ang_vel_b;
+}  // namespace
 
 namespace super_odometry {
 
@@ -18,8 +47,15 @@ namespace super_odometry {
     this->get_logger().set_level(rclcpp::Logger::Level::Debug);
     }
 
+    // Wires the node up: loads calibration and parameters, creates the
+    // subscriber for the feature message and all publishers, configures the
+    // LidarSLAM core with the tuning values, and starts the 100 ms timer
+    // that drives process().
     void laserMapping::initInterface() {
         //! Callback Groups
+        // A reentrant group lets the subscription callback and the process()
+        // timer run concurrently on the MultiThreadedExecutor; shared buffers
+        // are protected by mBuf.
         cb_group_ = create_callback_group(rclcpp::CallbackGroupType::Reentrant);
         rclcpp::SubscriptionOptions sub_options;
         sub_options.callback_group = cb_group_;
@@ -47,6 +83,8 @@ namespace super_odometry {
         RCLCPP_INFO(this->get_logger(), "line resolution %f plane resolution %f vision_laser_time_offset %f",
                 config_.lineRes, config_.planeRes, vision_laser_time_offset);
 
+        // Voxel-grid leaf sizes: planar features can be sparser than edge
+        // features, so planeRes is typically twice lineRes.
         downSizeFilterCorner.setLeafSize(config_.lineRes, config_.lineRes, config_.lineRes);
         downSizeFilterSurf.setLeafSize(config_.planeRes, config_.planeRes, config_.planeRes);
 
@@ -95,10 +133,13 @@ namespace super_odometry {
         pubprediction_source = this->create_publisher<std_msgs::msg::String>(
             ProjectName+"/prediction_source", 1);
 
+        // process() contains its own while(rclcpp::ok()) loop, so this timer
+        // effectively just launches it once on an executor thread.
         process_timer_ = this->create_wall_timer(
             std::chrono::milliseconds(static_cast<int>(100.)),
             std::bind(&laserMapping::process, this));
 
+        // Push the tuning parameters down into the SLAM core.
         slam.initROSInterface(shared_from_this());
         slam.localMap.lineRes_ = config_.lineRes;
         slam.localMap.planeRes_ = config_.planeRes;
@@ -126,6 +167,9 @@ namespace super_odometry {
 
     }
 
+    // Allocates all working point clouds, resets the odometry/map frame
+    // transforms to identity, sizes the odometry history buffers, and (in
+    // localization mode) loads the prior map from disk into the local map.
     void laserMapping::initializationParam() {
 
         laserCloudCornerLast.reset(new pcl::PointCloud<PointType>());
@@ -141,19 +185,20 @@ namespace super_odometry {
         laserCloudPriorOrg.reset(new pcl::PointCloud<PointType>());
         laserCloudPrior.reset(new pcl::PointCloud<PointType>());
 
-        Eigen::Quaterniond q_wmap_wodom_(1, 0, 0, 0);
-        Eigen::Vector3d t_wmap_wodom_(0, 0, 0);
-        Eigen::Quaterniond q_wodom_curr_(1, 0, 0, 0);
-        Eigen::Vector3d t_wodom_curr_(0, 0, 0);
-        Eigen::Quaterniond q_wodom_pre_(1, 0, 0, 0);
-        Eigen::Vector3d t_wodom_pre_(0, 0, 0);
+        Eigen::Quaterniond q_map_odom_initial(1, 0, 0, 0);
+        Eigen::Vector3d t_map_odom_initial(0, 0, 0);
+        Eigen::Quaterniond q_world_lidar_prediction_current_initial(1, 0, 0, 0);
+        Eigen::Vector3d t_odom_lidar_current_initial(0, 0, 0);
+        Eigen::Quaterniond q_world_lidar_prediction_prev_initial(1, 0, 0, 0);
+        Eigen::Vector3d t_odom_lidar_prev_initial(0, 0, 0);
 
-        q_wmap_wodom = q_wmap_wodom_;
-        t_wmap_wodom = t_wmap_wodom_;
-        q_wodom_curr = q_wodom_curr_;
-        t_wodom_curr = t_wodom_curr_;
-        q_wodom_pre = q_wodom_pre_;
-        t_wodom_pre = t_wodom_pre_;
+        q_map_odom = q_map_odom_initial;
+        t_map_odom = t_map_odom_initial;
+        q_world_lidar_prediction_current =
+            q_world_lidar_prediction_current_initial;
+        t_odom_lidar_current = t_odom_lidar_current_initial;
+        q_world_lidar_prediction_prev = q_world_lidar_prediction_prev_initial;
+        t_odom_lidar_prev = t_odom_lidar_prev_initial;
 
         imu_odom_buf.allocate(5000);
         visual_odom_buf.allocate(5000);
@@ -176,6 +221,9 @@ namespace super_odometry {
         }
     }
 
+    // Declares and reads all ROS parameters into config_. If read_pose_file
+    // is set, the initial pose for localization mode comes from a saved
+    // odometry file instead of the individual init_* parameters.
     bool laserMapping::readParameters()
     {
         // Declare with default values
@@ -246,6 +294,12 @@ namespace super_odometry {
     
    
 
+    // Callback for the LaserFeature message from the featureExtraction node.
+    // One message carries everything for a single scan (edge features, planar
+    // features, deskewed full cloud, IMU orientation), so pushing each part
+    // onto its own queue under one lock keeps the queue fronts synchronized:
+    // process() can later pop one element from each and know they belong to
+    // the same scan. No processing happens here to keep the callback fast.
     void laserMapping::laserFeatureInfoHandler(const super_odometry_msgs::msg::LaserFeature::SharedPtr msgIn) {
        
         mBuf.lock();
@@ -253,14 +307,19 @@ namespace super_odometry {
         surfLastBuf.push(msgIn->cloud_surface);
         realsenseBuf.push(msgIn->cloud_realsense);
         fullResBuf.push(msgIn->cloud_nodistortion);
-        Eigen::Quaterniond imuprediction_tmp(msgIn->initial_quaternion_w, msgIn->initial_quaternion_x,
-                                             msgIn->initial_quaternion_y, msgIn->initial_quaternion_z);
+        Eigen::Quaterniond q_world_lidar_prediction(
+            msgIn->initial_quaternion_w, msgIn->initial_quaternion_x,
+            msgIn->initial_quaternion_y, msgIn->initial_quaternion_z);
 
-        IMUPredictionBuf.push(imuprediction_tmp);
+        q_world_lidar_prediction_buf.push(q_world_lidar_prediction);
         mBuf.unlock();
     }
 
 
+// Computes the initial pose guess for the current scan. The scan-to-map
+// optimization is a local method: it only converges to the right answer if
+// it starts close to it, so a good prediction matters, especially under
+// fast motion. Three regimes:
 void laserMapping::setInitialGuess()
 {
   //Case1: First Frame Initialization 
@@ -278,67 +337,96 @@ void laserMapping::setInitialGuess()
   selectPosePrediction();
 }
 
+// First scan ever: there is no map yet, so this pose DEFINES the world
+// frame. Using the IMU's roll/pitch (with yaw zeroed, since a gyro cannot
+// observe heading) makes the world frame gravity-aligned: z points up and
+// the ground plane in the map is horizontal.
 void laserMapping::initializeFirstFrame(){
 
     //Get initial orientation from IMU prediction 
-    if(sensorMeas.imuPrediction.w()!=0){   //Have IMU data
+    if(sensorMeas.q_world_lidar_prediction.w()!=0){   //Have IMU data
         //Extract roll and pitch, zero out yaw 
-        tf2::Quaternion initial_orientation=utils::extractRollPitch(sensorMeas.imuPrediction);
-        q_w_curr=Eigen::Quaterniond(initial_orientation.w(), initial_orientation.x(),
-              initial_orientation.y(), initial_orientation.z());
-        auto q_extrinsic=Eigen::Quaterniond(imu_laser_R);
-        q_extrinsic.normalize();
-        q_w_curr=q_extrinsic.inverse()*q_w_curr;
+        tf2::Quaternion q_world_lidar_roll_pitch =
+            utils::extractRollPitch(sensorMeas.q_world_lidar_prediction);
+        q_world_lidar =
+            Eigen::Quaterniond(q_world_lidar_roll_pitch.w(),
+                               q_world_lidar_roll_pitch.x(),
+                               q_world_lidar_roll_pitch.y(),
+                               q_world_lidar_roll_pitch.z());
+        // The IMU attitude describes the IMU body; rotate it by the inverse
+        // IMU->lidar extrinsic so it describes the lidar body instead.
+        auto q_imu_lidar = Eigen::Quaterniond(R_imu_lidar);
+        q_imu_lidar.normalize();
+        q_world_lidar = q_imu_lidar.inverse() * q_world_lidar;
         
         
     }else{
 
-        q_w_curr=Eigen::Quaterniond(1,0,0,0); //If no IMU data, use identity rotation 
+        q_world_lidar=Eigen::Quaterniond(1,0,0,0); //If no IMU data, use identity rotation
 
     }
 
     //initialize position 
-    q_wodom_pre=q_w_curr;
-    T_w_lidar.rot=q_w_curr;
-    T_w_lidar.pos=Eigen::Vector3d::Zero();
+    q_world_lidar_prediction_prev=q_world_lidar;
+    T_world_lidar.rot=q_world_lidar;
+    T_world_lidar.pos=Eigen::Vector3d::Zero();
 
     //Overide with predefined pose if localization mode 
     if(slam.localization_mode){
-        T_w_lidar.pos=Eigen::Vector3d(slam.init_x,slam.init_y,slam.init_z);
-        tf2::Quaternion localization_pose;
-        localization_pose.setRPY(slam.init_roll, slam.init_pitch,slam.init_yaw);
-        T_w_lidar.rot=Eigen::Quaterniond(localization_pose.w(), localization_pose.x(),
-                                        localization_pose.y(), localization_pose.z());
-        slam.last_T_w_lidar=T_w_lidar;
+        T_world_lidar.pos=Eigen::Vector3d(slam.init_x,slam.init_y,slam.init_z);
+        tf2::Quaternion q_world_lidar_localization;
+        q_world_lidar_localization.setRPY(
+            slam.init_roll, slam.init_pitch, slam.init_yaw);
+        T_world_lidar.rot =
+            Eigen::Quaterniond(q_world_lidar_localization.w(),
+                               q_world_lidar_localization.x(),
+                               q_world_lidar_localization.y(),
+                               q_world_lidar_localization.z());
+        slam.T_world_lidar_prev=T_world_lidar;
     }
 
 }
 
+// Scans 2..~11 (the startup period): the map is still tiny and the
+// registration is unreliable, so trust the IMU attitude outright and assume
+// the robot has not moved. This keeps the first map chunks consistent.
 void laserMapping::initializeWithIMU(){
-    if(sensorMeas.imuPrediction.w()!=0){  //Have IMU data
+    if(sensorMeas.q_world_lidar_prediction.w()!=0){  //Have IMU data
     //Use IMU Orientation directly during startup for seconds 
-    tf2::Quaternion curr_imu(sensorMeas.imuPrediction.w(), sensorMeas.imuPrediction.x(),
-                             sensorMeas.imuPrediction.y(), sensorMeas.imuPrediction.z());
+    tf2::Quaternion q_world_lidar_prediction(
+        sensorMeas.q_world_lidar_prediction.w(),
+        sensorMeas.q_world_lidar_prediction.x(),
+        sensorMeas.q_world_lidar_prediction.y(),
+        sensorMeas.q_world_lidar_prediction.z());
     
     //Keep position from last frame 
-    t_w_curr=last_T_w_lidar.pos;
-    T_w_lidar.pos=t_w_curr;
+    t_world_lidar=T_world_lidar_prev.pos;
+    T_world_lidar.pos=t_world_lidar;
 
     //Update rotation 
-    q_w_curr=Eigen::Quaterniond(curr_imu.w(), curr_imu.x(), curr_imu.y(), curr_imu.z());
-    T_w_lidar.rot=q_w_curr;
+    q_world_lidar =
+        Eigen::Quaterniond(q_world_lidar_prediction.w(),
+                           q_world_lidar_prediction.x(),
+                           q_world_lidar_prediction.y(),
+                           q_world_lidar_prediction.z());
+    T_world_lidar.rot=q_world_lidar;
 
 
     }else
     {
       //No IMU data, use last rotation 
-      q_w_curr=last_T_w_lidar.rot;
-      t_w_curr=last_T_w_lidar.pos;
-      T_w_lidar=last_T_w_lidar;
+      q_world_lidar=T_world_lidar_prev.rot;
+      t_world_lidar=T_world_lidar_prev.pos;
+      T_world_lidar=T_world_lidar_prev;
 
     } 
 }
 
+// Normal operation: propagate the last optimized pose T_world_lidar forward to
+// the current scan time using the best available motion prediction. The
+// odometry sources (LIO/VIO/NIO) provide a RELATIVE transform between the
+// previous and current scan times, which is right-multiplied onto the pose
+// (i.e. composed in the body frame).
 void laserMapping::selectPosePrediction(){
 
 // Step1: Decide prediction source based on system state 
@@ -347,40 +435,57 @@ prediction_source=determinePredictionSource();
 //Step2: Get prediction from selected source 
 switch(prediction_source){
     case PredictionSource::LIO_ODOM:{
-    T_w_lidar= T_w_lidar*sensorMeas.lioPrediction;
+    T_world_lidar =
+        T_world_lidar * sensorMeas.T_lidar_prev_lidar_current_lio;
     break;
     } 
    
     case PredictionSource::VIO_ODOM:{
-    T_w_lidar= T_w_lidar*sensorMeas.vioPrediction;
+    T_world_lidar =
+        T_world_lidar * sensorMeas.T_lidar_prev_lidar_current_vio;
     break; 
     } 
 
     case PredictionSource::NEURAL_IMU_ODOM:{
-    T_w_lidar= T_w_lidar*sensorMeas.nioPrediction;
+    T_world_lidar =
+        T_world_lidar * sensorMeas.T_lidar_prev_lidar_current_neural;
     break; 
     } 
     case PredictionSource::IMU_ORIENTATION:{
-    Eigen::Quaterniond q_w_predict=q_w_curr*q_wodom_pre.inverse()*q_wodom_curr;
-    q_w_predict.normalize();
-    T_w_lidar.rot=q_w_predict;
-    q_wodom_pre=q_wodom_curr;
+    // Only orientation is predicted: apply the IMU's rotation change since
+    // the previous scan (q_world_lidar_prediction_prev^-1 *
+    // q_world_lidar_prediction_current) to the current
+    // world orientation. Position is left as-is.
+    Eigen::Quaterniond q_world_lidar_predicted =
+        q_world_lidar * q_world_lidar_prediction_prev.inverse() *
+        q_world_lidar_prediction_current;
+    q_world_lidar_predicted.normalize();
+    T_world_lidar.rot=q_world_lidar_predicted;
+    q_world_lidar_prediction_prev=q_world_lidar_prediction_current;
     break;
     } 
    
     case PredictionSource::CONSTANT_VELOCITY:{  
-    Transformd relative_pose=last_T_w_lidar.inverse()*T_w_lidar;
-    T_w_lidar=T_w_lidar*relative_pose;
+    // Assume the same motion as between the last two poses ("the robot
+    // keeps doing what it was doing").
+    Transformd T_lidar_prev_lidar_current =
+        T_world_lidar_prev.inverse()*T_world_lidar;
+    T_world_lidar=T_world_lidar*T_lidar_prev_lidar_current;
     break; 
     }
 }
 
-//Step4: Update current pose 
-q_w_curr=T_w_lidar.rot;
-t_w_curr=T_w_lidar.pos;
+//Step4: Update current pose (mirror T_world_lidar into the Ceres parameter block)
+q_world_lidar=T_world_lidar.rot;
+t_world_lidar=T_world_lidar.pos;
 
 }
 
+// Picks the prediction source. "Degenerate" means the lidar geometry does
+// not constrain all 6 degrees of freedom (e.g. a long featureless corridor
+// leaves forward translation unobservable); in that case lidar-based
+// odometry cannot be trusted and camera- or learning-based sources are
+// preferred. Falls back to constant velocity if nothing else is available.
 laserMapping::PredictionSource laserMapping::determinePredictionSource(){
 // If system is degerenate, prefer VIO or learning imu odom
 
@@ -397,7 +502,8 @@ if(slam.isDegenerate){
     if(sensorMeas.lio_prediction_status){
         return PredictionSource::LIO_ODOM;
     }
-    sensorMeas.imu_orientation_status=useIMUPrediction(sensorMeas.imuPrediction);
+    sensorMeas.imu_orientation_status =
+        useIMUPrediction(sensorMeas.q_world_lidar_prediction);
     if(sensorMeas.imu_orientation_status){
         return PredictionSource::IMU_ORIENTATION;
     }
@@ -411,6 +517,17 @@ return PredictionSource::CONSTANT_VELOCITY;
 
 }
 
+    // Publishes all per-scan outputs:
+    //  - the name of the prediction source used (for debugging),
+    //  - the 5x5-chunk local map around the robot (every 5th scan, debug only),
+    //  - the whole local map and, in localization mode, the prior map
+    //    (every 20th scan; these clouds are big),
+    //  - the full deskewed scan transformed into the world frame
+    //    ("registered_scan"),
+    //  - the optimized pose as two odometry messages (laser_odometry, which
+    //    imuPreintegration consumes, and an "incremental" variant),
+    //  - the accumulated trajectory path for RViz,
+    //  - optimization statistics (iteration counts, latency, ...).
     void laserMapping::publishTopic(){
 
         TicToc t_pub;
@@ -460,6 +577,10 @@ return PredictionSource::CONSTANT_VELOCITY;
             }
         }
 
+        // Transform the full scan from the lidar frame into the world frame
+        // using the optimized pose ("registering" the scan). Points closer
+        // than 0.1 m (squared distance < 0.01) are self-returns from the
+        // robot body and are skipped.
         int laserCloudFullResNum = laserCloudFullRes->points.size();
         for (int i = 0; i < laserCloudFullResNum; i++) {
             PointType const *const &pi = &laserCloudFullRes->points[i];
@@ -470,10 +591,13 @@ return PredictionSource::CONSTANT_VELOCITY;
 
             utils::pointAssociateToMap(&laserCloudFullRes->points[i],
                                 &laserCloudFullRes->points[i],
-                                q_w_curr,
-                                t_w_curr);
+                                q_world_lidar,
+                                t_world_lidar);
         }
 
+        // Round-trip through a ROS message, then drop the near-origin points
+        // that were skipped above, so the published cloud contains only
+        // valid, world-frame points.
         pcl::PointCloud<pcl::PointXYZI> laserCloudFullResCvt, laserCloudFullResClean;
         sensor_msgs::msg::PointCloud2 laserCloudFullRes3;
         pcl::toROSMsg(*laserCloudFullRes, laserCloudFullRes3);
@@ -495,6 +619,8 @@ return PredictionSource::CONSTANT_VELOCITY;
         laserCloudFullRes_rot->clear();
         laserCloudFullRes_rot->resize(laserCloudFullResNum);
 
+        // Axis-permuted copy of the registered cloud (x,y,z) -> (y,z,x), for
+        // consumers that use the camera-style z-forward convention.
         for (int i = 0; i < laserCloudFullResNum; i++) {
             laserCloudFullRes_rot->points[i].x = laserCloudFullRes->points[i].y;
             laserCloudFullRes_rot->points[i].y = laserCloudFullRes->points[i].z;
@@ -502,19 +628,22 @@ return PredictionSource::CONSTANT_VELOCITY;
             laserCloudFullRes_rot->points[i].intensity = laserCloudFullRes->points[i].intensity;
         }
 
+        // Main odometry output: the optimized world-frame pose plus the
+        // finite-difference body-frame velocities in the twist field. This
+        // is what the imuPreintegration node fuses with the IMU.
         nav_msgs::msg::Odometry odomAftMapped;
         odomAftMapped.header.frame_id = WORLD_FRAME;
         odomAftMapped.child_frame_id = SENSOR_FRAME;
         odomAftMapped.header.stamp = rclcpp::Time(timeLaserOdometry*1e9);
 
-        odomAftMapped.pose.pose.orientation.x = q_w_curr.x();
-        odomAftMapped.pose.pose.orientation.y = q_w_curr.y();
-        odomAftMapped.pose.pose.orientation.z = q_w_curr.z();
-        odomAftMapped.pose.pose.orientation.w = q_w_curr.w();
+        odomAftMapped.pose.pose.orientation.x = q_world_lidar.x();
+        odomAftMapped.pose.pose.orientation.y = q_world_lidar.y();
+        odomAftMapped.pose.pose.orientation.z = q_world_lidar.z();
+        odomAftMapped.pose.pose.orientation.w = q_world_lidar.w();
 
-        odomAftMapped.pose.pose.position.x = t_w_curr.x();
-        odomAftMapped.pose.pose.position.y = t_w_curr.y();
-        odomAftMapped.pose.pose.position.z = t_w_curr.z();
+        odomAftMapped.pose.pose.position.x = t_world_lidar.x();
+        odomAftMapped.pose.pose.position.y = t_world_lidar.y();
+        odomAftMapped.pose.pose.position.z = t_world_lidar.z();
 
         odomAftMapped.twist.twist.linear.x = vel_b.x();
         odomAftMapped.twist.twist.linear.y = vel_b.y();
@@ -524,6 +653,9 @@ return PredictionSource::CONSTANT_VELOCITY;
         odomAftMapped.twist.twist.angular.y = ang_vel_b.y();
         odomAftMapped.twist.twist.angular.z = ang_vel_b.z();
 
+        // Secondary "incremental" odometry: same pose but published under a
+        // separate topic, mirroring LIO-SAM's odometry_incremental (a stream
+        // guaranteed to be smooth/continuous for downstream consumers).
         nav_msgs::msg::Odometry laserOdomIncremental;
 
         if (initialization == false)
@@ -531,35 +663,37 @@ return PredictionSource::CONSTANT_VELOCITY;
             laserOdomIncremental.header.stamp = rclcpp::Time(timeLaserOdometry*1e9);
             laserOdomIncremental.header.frame_id = WORLD_FRAME;
             laserOdomIncremental.child_frame_id =  SENSOR_FRAME;
-            laserOdomIncremental.pose.pose.position.x = t_w_curr.x();
-            laserOdomIncremental.pose.pose.position.y = t_w_curr.y();
-            laserOdomIncremental.pose.pose.position.z = t_w_curr.z();
-            laserOdomIncremental.pose.pose.orientation.x = q_w_curr.x();
-            laserOdomIncremental.pose.pose.orientation.y = q_w_curr.y();
-            laserOdomIncremental.pose.pose.orientation.z = q_w_curr.z();
-            laserOdomIncremental.pose.pose.orientation.w = q_w_curr.w();
+            laserOdomIncremental.pose.pose.position.x = t_world_lidar.x();
+            laserOdomIncremental.pose.pose.position.y = t_world_lidar.y();
+            laserOdomIncremental.pose.pose.position.z = t_world_lidar.z();
+            laserOdomIncremental.pose.pose.orientation.x = q_world_lidar.x();
+            laserOdomIncremental.pose.pose.orientation.y = q_world_lidar.y();
+            laserOdomIncremental.pose.pose.orientation.z = q_world_lidar.z();
+            laserOdomIncremental.pose.pose.orientation.w = q_world_lidar.w();
         }
         else
         {
 
-            laser_incremental_T = T_w_lidar;
-            laser_incremental_T.rot.normalized();
+            T_world_lidar_incremental = T_world_lidar;
+            T_world_lidar_incremental.rot.normalized();
 
             laserOdomIncremental.header.stamp = rclcpp::Time(timeLaserOdometry*1e9);
             laserOdomIncremental.header.frame_id = WORLD_FRAME;
             laserOdomIncremental.child_frame_id =  SENSOR_FRAME;
-            laserOdomIncremental.pose.pose.position.x = laser_incremental_T.pos.x();
-            laserOdomIncremental.pose.pose.position.y = laser_incremental_T.pos.y();
-            laserOdomIncremental.pose.pose.position.z = laser_incremental_T.pos.z();
-            laserOdomIncremental.pose.pose.orientation.x = laser_incremental_T.rot.x();
-            laserOdomIncremental.pose.pose.orientation.y = laser_incremental_T.rot.y();
-            laserOdomIncremental.pose.pose.orientation.z = laser_incremental_T.rot.z();
-            laserOdomIncremental.pose.pose.orientation.w = laser_incremental_T.rot.w();
+            laserOdomIncremental.pose.pose.position.x = T_world_lidar_incremental.pos.x();
+            laserOdomIncremental.pose.pose.position.y = T_world_lidar_incremental.pos.y();
+            laserOdomIncremental.pose.pose.position.z = T_world_lidar_incremental.pos.z();
+            laserOdomIncremental.pose.pose.orientation.x = T_world_lidar_incremental.rot.x();
+            laserOdomIncremental.pose.pose.orientation.y = T_world_lidar_incremental.rot.y();
+            laserOdomIncremental.pose.pose.orientation.z = T_world_lidar_incremental.rot.z();
+            laserOdomIncremental.pose.pose.orientation.w = T_world_lidar_incremental.rot.w();
         }
 
         pubLaserOdometryIncremental->publish(laserOdomIncremental);
 
 
+        // Overload covariance[0] as a degeneracy flag (1 = the scan-to-map
+        // problem was ill-conditioned) so consumers can lower their trust.
         if (slam.isDegenerate) {
             odomAftMapped.pose.covariance[0] = 1;
         } else {
@@ -578,6 +712,8 @@ return PredictionSource::CONSTANT_VELOCITY;
         pubLaserAfterMappedPath->publish(laserAfterMappedPath);
 
 
+        // Optimization statistics: latency between the newest IMU odometry
+        // and this mapping result, plus per-iteration convergence data.
         slam.stats.header = odomAftMapped.header;
         if (timeLatestImuOdometry.seconds() < 1.0)
         {
@@ -597,6 +733,12 @@ return PredictionSource::CONSTANT_VELOCITY;
     }
 
 
+    // Adapts the voxel-filter resolution to the scene, then downsamples the
+    // feature clouds. Reasoning: indoors, points are close together and a
+    // fine grid (0.1/0.2 m) keeps enough detail; outdoors, points are spread
+    // out and a coarse grid (0.4/0.8 m) keeps the point count (and thus the
+    // Ceres problem size) manageable. Downsampling also ensures features are
+    // roughly evenly distributed so no region dominates the cost function.
     void laserMapping::adjustVoxelSize(){
 
         // Calculate cloud statistics
@@ -610,15 +752,21 @@ return PredictionSource::CONSTANT_VELOCITY;
                 average(0) += fabs(point.x);
                 average(1) += fabs(point.y);
                 average(2) += fabs(point.z);
+                // Count points farther than 3 m (squared distance > 9 m^2).
                 if(point.x*point.x + point.y*point.y + point.z*point.z>9){
                     count_far_points++;
                 }
             }
+            // With plenty of far points, close-range returns (often the robot
+            // itself or dust) can be ignored by enlarging the blind radius.
             if (count_far_points > 3000)
             {
                 increase_blind_radius = true;
             }
 
+            // Scene-size proxy: product of the mean absolute x, y and z
+            // coordinates (roughly the volume the scan spans). < 25 means a
+            // tight indoor space, > 65 a wide outdoor space.
             average /= laserCloudSurfLast->points.size();
             slam.stats.average_distance = average(0)*average(1)*average(2);
             if (slam.stats.average_distance < 25)
@@ -651,12 +799,18 @@ return PredictionSource::CONSTANT_VELOCITY;
     }
 
     
+    // True once every buffer holds at least one message, i.e. a complete
+    // scan bundle is ready to be processed.
     bool  laserMapping::checkDataAvailable() const{
-        return !cornerLastBuf.empty() && !surfLastBuf.empty() 
-               && !fullResBuf.empty() && !IMUPredictionBuf.empty();       
+        return !cornerLastBuf.empty() && !surfLastBuf.empty()
+               && !fullResBuf.empty()
+               && !q_world_lidar_prediction_buf.empty();
         //Note: in pure laser odometry, IMU Prediction will be identy. 
     }
 
+    // Pops the front element of each input buffer (they are pushed together,
+    // so the fronts belong to the same scan) and converts the ROS clouds to
+    // PCL. Caller must hold mBuf.
     laserMapping::SensorData laserMapping::extractSensorData(){
         
         SensorData data;
@@ -673,9 +827,10 @@ return PredictionSource::CONSTANT_VELOCITY;
         fullResBuf.pop();
 
         //3. Extract IMU prediction 
-        data.imuPrediction=IMUPredictionBuf.front();
-        data.imuPrediction.normalize();
-        IMUPredictionBuf.pop();
+        data.q_world_lidar_prediction =
+            q_world_lidar_prediction_buf.front();
+        data.q_world_lidar_prediction.normalize();
+        q_world_lidar_prediction_buf.pop();
 
         //4 set status for prediction source (TODO: didn't release code other prediction source yet) 
         data.vio_prediction_status=false;
@@ -686,6 +841,10 @@ return PredictionSource::CONSTANT_VELOCITY;
         return data;
     }
 
+    // Empties all input buffers. Called right after extractSensorData: if the
+    // optimizer is slower than the sensor, older scans are deliberately
+    // dropped so the node always works on the latest scan instead of falling
+    // further and further behind real time.
     void laserMapping::clearSensorData(){
         auto clearBuffer=[](auto&buffer){
             while(!buffer.empty()){
@@ -695,31 +854,46 @@ return PredictionSource::CONSTANT_VELOCITY;
         clearBuffer(cornerLastBuf);
         clearBuffer(surfLastBuf);
         clearBuffer(fullResBuf);
-        clearBuffer(IMUPredictionBuf);
+        clearBuffer(q_world_lidar_prediction_buf);
     }
 
 
+    // Runs the actual scan-to-map registration. Optionally passes the IMU's
+    // roll/pitch to the SLAM core so those two angles can be constrained to
+    // gravity during optimization (an IMU observes roll/pitch absolutely,
+    // whereas the lidar only observes them relative to the map). Then calls
+    // slam.Localization(), which finds point-to-line / point-to-plane
+    // correspondences in the local map, builds the Ceres problem, solves for
+    // T_world_lidar, and merges the scan into the map.
     void laserMapping::performSLAMOptimization(){
-        tf2::Quaternion imu_roll_pitch;
+        tf2::Quaternion q_world_lidar_roll_pitch;
         if(config_.use_imu_roll_pitch){  // TODO: Livox mid360 not use roll pitch angle
             slam.OptSet.use_imu_roll_pitch=true;
-            imu_roll_pitch=utils::extractRollPitch(sensorMeas.imuPrediction);
-            slam.OptSet.imu_roll_pitch=imu_roll_pitch;
+            q_world_lidar_roll_pitch =
+                utils::extractRollPitch(sensorMeas.q_world_lidar_prediction);
+            slam.OptSet.q_world_lidar_roll_pitch =
+                q_world_lidar_roll_pitch;
         }else{
             slam.OptSet.use_imu_roll_pitch=false;
-            slam.OptSet.imu_roll_pitch=tf2::Quaternion(0,0,0,1);
+            slam.OptSet.q_world_lidar_roll_pitch =
+                tf2::Quaternion(0,0,0,1);
         }
 
-        slam.Localization(initialization, static_cast<LidarSLAM::PredictionSource>(prediction_source), T_w_lidar,
+        slam.Localization(initialization, static_cast<LidarSLAM::PredictionSource>(prediction_source), T_world_lidar,
                  laserCloudCornerStack, laserCloudSurfStack, timeLaserOdometry);
     }
 
 
-    bool laserMapping::useIMUPrediction(const Eigen::Quaterniond& imuPrediction){
-        if (imuPrediction.w()!=0)
+    // A zero quaternion (w == 0) marks "no IMU data" upstream; a valid
+    // rotation always has w != 0 here. Stores the orientation as the current
+    // odometry-frame prediction when valid.
+    bool laserMapping::useIMUPrediction(
+        const Eigen::Quaterniond& q_world_lidar_prediction) {
+        if (q_world_lidar_prediction.w()!=0)
         {
-            q_wodom_curr=imuPrediction;
-            q_wodom_curr.normalize();
+            q_world_lidar_prediction_current =
+                q_world_lidar_prediction;
+            q_world_lidar_prediction_current.normalize();
             return true;
         }
         else
@@ -728,30 +902,41 @@ return PredictionSource::CONSTANT_VELOCITY;
         }
     }
 
+    // Accepts the optimized pose from the SLAM core, derives velocities, and
+    // publishes everything for this scan.
     void laserMapping::updatePoseAndPublish(){
 
         //1. Update pose 
-        q_w_curr=slam.T_w_lidar.rot;
-        t_w_curr=slam.T_w_lidar.pos;
-        T_w_lidar.rot=slam.T_w_lidar.rot;
-        T_w_lidar.pos=slam.T_w_lidar.pos;
+        q_world_lidar=slam.T_world_lidar.rot;
+        t_world_lidar=slam.T_world_lidar.pos;
+        T_world_lidar.rot=slam.T_world_lidar.rot;
+        T_world_lidar.pos=slam.T_world_lidar.pos;
         startupCount=slam.startupCount;
         frameCount++;
         slam.frame_count=frameCount;
         slam.laser_imu_sync=laser_imu_sync;
         initialization = true;
 
-        // Calculate linear and angular velocity
+        // Calculate linear and angular velocity by finite-differencing the
+        // last two optimized poses over the scan interval dt (~0.1 s).
         double dt = timeLaserOdometry - timeLaserOdometryPrev;
 
         if (dt > 1e-6) {  
-            Eigen::Vector3d vel_w = (t_w_curr - last_T_w_lidar.pos) / dt;
-            vel_b = q_w_curr.inverse() * vel_w;     
+            // World-frame velocity, rotated into the body frame (odometry
+            // twist is conventionally expressed in the child/body frame).
+            Eigen::Vector3d v_world =
+                (t_world_lidar - T_world_lidar_prev.pos) / dt;
+            vel_b = q_world_lidar.inverse() * v_world;
 
-            Eigen::Quaterniond dq = q_w_curr * last_T_w_lidar.rot.inverse();
-            Eigen::AngleAxisd angle_axis(dq);
-            Eigen::Vector3d ang_vel_w = angle_axis.axis() * angle_axis.angle() / dt;
-            ang_vel_b = q_w_curr.inverse() * ang_vel_w;
+            // Rotation change dq between the two poses, converted to
+            // axis-angle; axis * angle / dt approximates the angular
+            // velocity vector (rad/s).
+            Eigen::Quaterniond q_world_lidar_change =
+                q_world_lidar * T_world_lidar_prev.rot.inverse();
+            Eigen::AngleAxisd angle_axis(q_world_lidar_change);
+            Eigen::Vector3d ang_vel_world =
+                angle_axis.axis() * angle_axis.angle() / dt;
+            ang_vel_b = q_world_lidar.inverse() * ang_vel_world;
         } else {
             vel_b = Eigen::Vector3d::Zero();
             ang_vel_b = Eigen::Vector3d::Zero();
@@ -761,10 +946,13 @@ return PredictionSource::CONSTANT_VELOCITY;
         publishTopic();
 
         //3. Store current pose and time for next iteration
-        last_T_w_lidar = slam.T_w_lidar;
+        T_world_lidar_prev = slam.T_world_lidar;
         timeLaserOdometryPrev = timeLaserOdometry;
     }
 
+    // Main loop. Started by the wall timer but never returns: it keeps one
+    // executor thread busy polling for new scan bundles and running the
+    // guess -> downsample -> optimize -> publish pipeline on each of them.
     void laserMapping::process() {
 
         while (rclcpp::ok()) {

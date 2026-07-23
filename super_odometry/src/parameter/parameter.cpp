@@ -1,6 +1,22 @@
 //
 // Created by shibo zhao on 2020-09-27.
 //
+// ============================================================================
+// OVERVIEW (read this first)
+// ============================================================================
+// This file defines the global configuration variables declared in
+// config/parameter.h and implements the two functions that fill them in:
+//
+//   - readGlobalparam(): reads topic names, TF frame names and generic
+//     settings from the ROS parameter file.
+//   - readCalibration(): reads the sensor extrinsics from the calibration
+//     YAML (an OpenCV FileStorage file whose path comes from the
+//     "calibration_file" ROS parameter) and builds the IMU<->lidar
+//     transforms T_imu_lidar / T_lidar_imu used throughout the pipeline.
+//
+// Every SuperOdom node calls both functions once at startup; afterwards the
+// globals are treated as read-only.
+// ============================================================================
 #include "super_odometry/config/parameter.h"
 
 // Define color escape codes for ~beautification~
@@ -33,33 +49,33 @@ SensorType sensor;
 
 int PROVIDE_IMU_LASER_EXTRINSIC;
 
-Eigen::Matrix3d imu_laser_R;
+Eigen::Matrix3d R_imu_lidar;
 
-Eigen::Vector3d imu_laser_T;
+Eigen::Vector3d t_imu_lidar;
 
-Eigen::Vector3d imu_laser_offset;
+Eigen::Vector3d rpy_imu_lidar_offset_deg;
 
-Eigen::Matrix3d cam_laser_R;
+Eigen::Matrix3d R_camera_lidar;
 
-Eigen::Vector3d cam_laser_T;
+Eigen::Vector3d t_camera_lidar;
 
-Eigen::Matrix3d imu_camera_R;
+Eigen::Matrix3d R_imu_camera;
 
-Eigen::Vector3d imu_camera_T;
+Eigen::Vector3d t_imu_camera;
 
-Transformd Tcam_lidar;
+Transformd T_camera_lidar;
 
-Transformd T_i_c;
+Transformd T_imu_camera;
 
-Transformd T_i_l;
+Transformd T_imu_lidar;
 
-Transformd T_l_i;
+Transformd T_lidar_imu;
 
-Transformd T_ouster_sensor;
+Transformd T_sensor_ouster;
 
-Eigen::Matrix3d ouster_sensor_R;
+Eigen::Matrix3d R_sensor_ouster;
 
-Eigen::Vector3d ouster_sensor_T;
+Eigen::Vector3d t_sensor_ouster;
 
 float lidar_imu_offset_roll;
 
@@ -102,6 +118,8 @@ bool SAVE_PLY;
 std::string SENSOR;
 
 
+/// Reads a single ROS parameter that must already be declared; shuts the
+/// node down if the parameter is missing (all parameters here are required).
 template <typename T>
 T readParam(rclcpp::Node::SharedPtr node, std::string name)
 {
@@ -117,6 +135,14 @@ T readParam(rclcpp::Node::SharedPtr node, std::string name)
     return ans;
 }
 
+/// Loads sensor extrinsics from the calibration YAML into the globals and
+/// builds T_imu_lidar and its inverse T_lidar_imu. Two paths exist:
+///  - PROVIDE_IMU_LASER_EXTRINSIC set: read extrinsicRotation_imu_laser /
+///    extrinsicTranslation_imu_laser directly as T_imu_lidar, mapping
+///    lidar-frame points into the IMU frame, and apply the optional
+///    roll/pitch/yaw offset from imu_laser_rotation_offset.
+///  - otherwise: chain the transform through the camera,
+///    T_imu_lidar = T_imu_camera * T_camera_lidar.
 bool readCalibration(rclcpp::Node::SharedPtr node)
 {
     RCLCPP_INFO(node->get_logger(), "[super_odometry] read parameter");
@@ -169,118 +195,144 @@ bool readCalibration(rclcpp::Node::SharedPtr node)
     
     if (PROVIDE_IMU_LASER_EXTRINSIC)
     {
-        cv::Mat cv_R, cv_T;
+        cv::Mat cv_R_imu_lidar, cv_t_imu_lidar;
 
-        cv::Mat imu_laser_rotation_offset;
-        fsSettings["imu_laser_rotation_offset"] >> imu_laser_rotation_offset;
-        fsSettings["extrinsicRotation_imu_laser"] >> cv_R;
-        fsSettings["extrinsicTranslation_imu_laser"] >> cv_T;
-        cv::cv2eigen(cv_R, imu_laser_R);
-        cv::cv2eigen(cv_T, imu_laser_T);
-        cv::cv2eigen(imu_laser_rotation_offset, imu_laser_offset);
-        // RCLCPP_INFO(node->get_logger(),  "\n imu_laser_R: \n"
-        //           << imu_laser_R;
-        // RCLCPP_INFO(node->get_logger(),  "\n imu_laser_T: \n"
-        //           << imu_laser_T.transpose();
+        cv::Mat cv_rpy_imu_lidar_offset_deg;
+        fsSettings["imu_laser_rotation_offset"] >> cv_rpy_imu_lidar_offset_deg;
+        fsSettings["extrinsicRotation_imu_laser"] >> cv_R_imu_lidar;
+        fsSettings["extrinsicTranslation_imu_laser"] >> cv_t_imu_lidar;
+        cv::cv2eigen(cv_R_imu_lidar, R_imu_lidar);
+        cv::cv2eigen(cv_t_imu_lidar, t_imu_lidar);
+        cv::cv2eigen(cv_rpy_imu_lidar_offset_deg, rpy_imu_lidar_offset_deg);
+        // RCLCPP_INFO(node->get_logger(),  "\n R_imu_lidar: \n"
+        //           << R_imu_lidar;
+        // RCLCPP_INFO(node->get_logger(),  "\n t_imu_lidar: \n"
+        //           << t_imu_lidar.transpose();
         
-        // RCLCPP_INFO(node->get_logger(),  "\n imu_laser_rotation_offset: \n" << imu_laser_offset.transpose();
+        // RCLCPP_INFO(node->get_logger(),  "\n rpy_imu_lidar_offset_deg: \n" << rpy_imu_lidar_offset_deg.transpose();
         
-        // RCLCPP_INFO(node->get_logger(), BLUE <<"\n Before Apply offset on  imu_laser_R : \n"<<RESET
-        //           << imu_laser_R;
-        // RCLCPP_INFO(node->get_logger(), "\n Before Apply offset on  imu_laser_R : \n"
-        //           << imu_laser_R;
+        // RCLCPP_INFO(node->get_logger(), BLUE <<"\n Before applying offset to R_imu_lidar: \n"<<RESET
+        //           << R_imu_lidar;
+        // RCLCPP_INFO(node->get_logger(), "\n Before applying offset to R_imu_lidar: \n"
+        //           << R_imu_lidar;
 
-        //previous rotation matrix
-        T_i_l = Transformd(imu_laser_R, imu_laser_T);
-        T_l_i = T_i_l.inverse();   
+        // Build the IMU <- lidar transform from the raw YAML values:
+        // p_imu = T_imu_lidar * p_lidar. T_lidar_imu is its inverse.
+        T_imu_lidar = Transformd(R_imu_lidar, t_imu_lidar);
+        T_lidar_imu = T_imu_lidar.inverse();
         
-        //previous roll, pitch, yaw
+        // Log the roll/pitch/yaw of the raw extrinsic (degrees) so a bad
+        // calibration file is easy to spot in the console.
         double roll, pitch, yaw;
-        tf2::Quaternion orientation_pre(T_i_l.rot.x(), T_i_l.rot.y(), T_i_l.rot.z(), T_i_l.rot.w());
-        tf2::Matrix3x3(orientation_pre).getRPY(roll, pitch, yaw);
+        tf2::Quaternion q_imu_lidar_raw(T_imu_lidar.rot.x(), T_imu_lidar.rot.y(),
+                                       T_imu_lidar.rot.z(), T_imu_lidar.rot.w());
+        tf2::Matrix3x3(q_imu_lidar_raw).getRPY(roll, pitch, yaw);
         RCLCPP_INFO(node->get_logger(), BLUE"\n previous roll: %f previous pitch: %f previous yaw: %f" RESET, roll *180/M_PI, pitch *180/M_PI, yaw *180/M_PI); 
 
-        //add offset rotation matrix
-        tf2::Quaternion IMU_LASER_R_offset;
-        IMU_LASER_R_offset.setRPY(imu_laser_offset[0]* M_PI / 180, imu_laser_offset[1] * M_PI / 180, 
-                            imu_laser_offset[2]* M_PI / 180);
+        // Apply the optional hand-tuned correction:
+        // rpy_imu_lidar_offset_deg is converted to radians and composed on
+        // the left of the YAML rotation.
+        tf2::Quaternion q_imu_lidar_offset;
+        q_imu_lidar_offset.setRPY(rpy_imu_lidar_offset_deg[0] * M_PI / 180,
+                                  rpy_imu_lidar_offset_deg[1] * M_PI / 180,
+                                  rpy_imu_lidar_offset_deg[2] * M_PI / 180);
 
-        tf2::Quaternion IMU_LASER_R(T_i_l.rot.x(), T_i_l.rot.y(), T_i_l.rot.z(),
-                                                        T_i_l.rot.w());
-        tf2::Quaternion IMU_LASER = IMU_LASER_R_offset * IMU_LASER_R;
-        Eigen::Quaterniond imu_laser_rot;             
-        imu_laser_rot = Eigen::Quaterniond(IMU_LASER.w(), IMU_LASER.x(), IMU_LASER.y(),
-                                                      IMU_LASER.z());
+        tf2::Quaternion q_imu_lidar_before_offset(
+            T_imu_lidar.rot.x(), T_imu_lidar.rot.y(), T_imu_lidar.rot.z(),
+            T_imu_lidar.rot.w());
+        tf2::Quaternion q_imu_lidar_corrected_tf2 =
+            q_imu_lidar_offset * q_imu_lidar_before_offset;
+        Eigen::Quaterniond q_imu_lidar;
+        q_imu_lidar = Eigen::Quaterniond(
+            q_imu_lidar_corrected_tf2.w(), q_imu_lidar_corrected_tf2.x(),
+            q_imu_lidar_corrected_tf2.y(), q_imu_lidar_corrected_tf2.z());
          
-        T_i_l.rot=imu_laser_rot;
-        T_l_i = T_i_l.inverse(); 
-        imu_laser_R=T_i_l.rot.toRotationMatrix();
+        // Store the corrected rotation back into the globals so that every
+        // consumer (including R_imu_lidar itself) sees the offset applied.
+        T_imu_lidar.rot=q_imu_lidar;
+        T_lidar_imu = T_imu_lidar.inverse();
+        R_imu_lidar=T_imu_lidar.rot.toRotationMatrix();
         
-        RCLCPP_INFO_STREAM(node->get_logger(),  GREEN BOLD "T_i_l Extrinsic : \n" << T_i_l.matrix());
-        RCLCPP_INFO_STREAM(node->get_logger(),  GREEN BOLD "T_l_i Extrinsic : \n" << T_l_i.matrix()); 
+        RCLCPP_INFO_STREAM(node->get_logger(),  GREEN BOLD "T_imu_lidar extrinsic:\n" << T_imu_lidar.matrix());
+        RCLCPP_INFO_STREAM(node->get_logger(),  GREEN BOLD "T_lidar_imu extrinsic:\n" << T_lidar_imu.matrix());
 
-        //lasted roll pitch yaw
+        // Log the roll/pitch/yaw after the offset (degrees) for comparison.
         double updated_roll, updated_pitch, updated_yaw;
-        tf2::Quaternion orientation_curr(IMU_LASER.x(), IMU_LASER.y(), IMU_LASER.z(), IMU_LASER.w());
-        tf2::Matrix3x3(orientation_curr).getRPY(updated_roll, updated_pitch, updated_yaw);
+        tf2::Quaternion q_imu_lidar_corrected(
+            q_imu_lidar_corrected_tf2.x(), q_imu_lidar_corrected_tf2.y(),
+            q_imu_lidar_corrected_tf2.z(), q_imu_lidar_corrected_tf2.w());
+        tf2::Matrix3x3(q_imu_lidar_corrected).getRPY(updated_roll, updated_pitch, updated_yaw);
         
         RCLCPP_INFO(node->get_logger(), GREEN BOLD"\n updated roll: %f updated pitch: %f updated yaw: %f" RESET, updated_roll*180/M_PI, updated_pitch *180/M_PI, updated_yaw*180/M_PI); 
 
-        // RCLCPP_INFO(node->get_logger(), "\n After Apply offset on  imu_laser_R : \n"
-        //           << imu_laser_R; 
-        // RCLCPP_INFO(node->get_logger(), "\n Apply offset on  T_i_l : \n"
-        //           << T_i_l; 
+        // RCLCPP_INFO(node->get_logger(), "\n After applying offset to R_imu_lidar: \n"
+        //           << R_imu_lidar;
+        // RCLCPP_INFO(node->get_logger(), "\n After applying offset to T_imu_lidar: \n"
+        //           << T_imu_lidar;
     }
     else
     {
+        // No direct T_imu_lidar calibration: read T_camera_lidar and
+        // T_imu_camera, both mapping child-frame points into their parent,
+        // and compose
+        // T_imu_lidar = T_imu_camera * T_camera_lidar.
         cv::Mat cv_R, cv_T;
         fsSettings["extrinsicRotation_camera_laser"] >> cv_R;
         fsSettings["extrinsicTranslation_camera_laser"] >> cv_T;
-        cv::cv2eigen(cv_R, cam_laser_R);
-        cv::cv2eigen(cv_T, cam_laser_T);
+        cv::cv2eigen(cv_R, R_camera_lidar);
+        cv::cv2eigen(cv_T, t_camera_lidar);
 
-        Tcam_lidar = Transformd(cam_laser_R, cam_laser_T);
+        T_camera_lidar = Transformd(R_camera_lidar, t_camera_lidar);
 
-        // RCLCPP_INFO(node->get_logger(),  "\n cam_laser_R: \n"
-        //           << cam_laser_R;
-        // RCLCPP_INFO(node->get_logger(),  "\n cam_laser_T: \n"
-        //           << cam_laser_T.transpose();
-        // RCLCPP_INFO(node->get_logger(),  "\n T_cam_lidar: \n"
-        //           << Tcam_lidar;
+        // RCLCPP_INFO(node->get_logger(),  "\n R_camera_lidar: \n"
+        //           << R_camera_lidar;
+        // RCLCPP_INFO(node->get_logger(),  "\n t_camera_lidar: \n"
+        //           << t_camera_lidar.transpose();
+        // RCLCPP_INFO(node->get_logger(),  "\n T_camera_lidar: \n"
+        //           << T_camera_lidar;
 
         fsSettings["extrinsicRotation_imu_camera"] >> cv_R;
         fsSettings["extrinsicTranslation_imu_camera"] >> cv_T;
 
-        cv::cv2eigen(cv_R, imu_camera_R);
-        cv::cv2eigen(cv_T, imu_camera_T);
-        Eigen::Quaterniond Q(imu_camera_R);
-        imu_camera_R = Q.normalized();
+        cv::cv2eigen(cv_R, R_imu_camera);
+        cv::cv2eigen(cv_T, t_imu_camera);
+        // Round-trip through a quaternion to clean up numerical errors and
+        // guarantee the matrix is a proper rotation.
+        Eigen::Quaterniond q_imu_camera(R_imu_camera);
+        R_imu_camera = q_imu_camera.normalized();
 
-        T_i_c = Transformd(imu_camera_R, imu_camera_T);
+        T_imu_camera = Transformd(R_imu_camera, t_imu_camera);
 
-        T_i_l = T_i_c * Tcam_lidar;
-        T_l_i = T_i_l.inverse();
+        T_imu_lidar = T_imu_camera * T_camera_lidar;
+        T_lidar_imu = T_imu_lidar.inverse();
 
-        // RCLCPP_INFO(node->get_logger(),  "imu_camera_R: \n"
-        //           << imu_camera_R;
-        // RCLCPP_INFO(node->get_logger(),  "Timu_camera_T : \n"
-        //           << imu_camera_T;
+        // RCLCPP_INFO(node->get_logger(),  "R_imu_camera: \n"
+        //           << R_imu_camera;
+        // RCLCPP_INFO(node->get_logger(),  "t_imu_camera: \n"
+        //           << t_imu_camera;
 
-        RCLCPP_INFO_STREAM(node->get_logger(),  GREEN BOLD "T_i_l Extrinsic : \n" << T_i_l.matrix());
-        RCLCPP_INFO_STREAM(node->get_logger(),  GREEN BOLD "T_l_i Extrinsic : \n" << T_l_i.matrix());
+        RCLCPP_INFO_STREAM(node->get_logger(),  GREEN BOLD "T_imu_lidar extrinsic:\n" << T_imu_lidar.matrix());
+        RCLCPP_INFO_STREAM(node->get_logger(),  GREEN BOLD "T_lidar_imu extrinsic:\n" << T_lidar_imu.matrix());
     }
 
-    ouster_sensor_R << -1, 0,  0,
-                    0, -1, 0,
-                    0,  0,  1;
+    // Fixed transform between the Ouster "sensor" frame and its internal
+    // lidar frame (from the Ouster datasheet): the lidar frame is rotated
+    // 180 degrees about z and sits 36.18 mm above the sensor origin.
+    R_sensor_ouster << -1, 0,  0,
+                       0, -1, 0,
+                       0,  0,  1;
 
-    ouster_sensor_T << 0, 0, 0.036180;
+    t_sensor_ouster << 0, 0, 0.036180;
 
-    T_ouster_sensor = Transformd(ouster_sensor_R, ouster_sensor_T);
+    T_sensor_ouster = Transformd(R_sensor_ouster, t_sensor_ouster);
 
     return true;
 }
 
+/// Loads topic names, TF frame names and generic settings from the ROS
+/// parameter file. Every parameter has a default, so the node still starts
+/// with an incomplete configuration; only an unsupported sensor string makes
+/// this function fail.
 bool readGlobalparam(rclcpp::Node::SharedPtr node)
 {
     node->declare_parameter<std::string>("imu_topic","imu/data");
