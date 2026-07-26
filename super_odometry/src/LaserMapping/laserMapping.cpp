@@ -924,14 +924,20 @@ return PredictionSource::CONSTANT_VELOCITY;
                 (t_world_lidar - T_world_lidar_prev.pos) / dt;
             vel_b = q_world_lidar.inverse() * v_world;
 
-            // Rotation change dq between the two poses, converted to
-            // axis-angle; axis * angle / dt approximates the angular
-            // velocity vector (rad/s).
-            Eigen::Quaterniond q_world_lidar_change =
+            // Let R_prev and R_curr map lidar vectors into the world frame.
+            // The left/inertial increment is defined by
+            //   R_curr = delta_R_world * R_prev,
+            // therefore
+            //   delta_R_world = R_curr * R_prev.inverse().
+            // This is an active rotation whose axis is expressed in world
+            // coordinates; it is not another world<-lidar frame transform.
+            Eigen::Quaterniond q_rotation_increment_world =
                 q_world_lidar * T_world_lidar_prev.rot.inverse();
-            Eigen::AngleAxisd angle_axis(q_world_lidar_change);
+            Eigen::AngleAxisd angle_axis(q_rotation_increment_world);
             Eigen::Vector3d ang_vel_world =
                 angle_axis.axis() * angle_axis.angle() / dt;
+
+            // Odometry twist is expressed in the current child (lidar) frame.
             ang_vel_b = q_world_lidar.inverse() * ang_vel_world;
         } else {
             vel_b = Eigen::Vector3d::Zero();
