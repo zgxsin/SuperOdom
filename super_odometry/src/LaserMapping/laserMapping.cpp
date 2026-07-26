@@ -107,7 +107,7 @@ namespace super_odometry {
         pubLaserCloudFullRes = this->create_publisher<sensor_msgs::msg::PointCloud2>(
             ProjectName+"/registered_scan", 2);
 
-
+        // Main output: the global lidar pose at the end of optimization.
         pubOdomAftMapped = this->create_publisher<nav_msgs::msg::Odometry>(
             ProjectName+"/laser_odometry", 1);
 

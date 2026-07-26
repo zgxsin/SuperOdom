@@ -1,6 +1,19 @@
 //
 // Created by shibo zhao on 2020-09-27.
 //
+// Frame convention:
+// This node does not initialize an independent world frame. It subscribes to
+// the lidar pose T_world_lidar published by laserMapping and therefore uses
+// the same numerical world frame. The corresponding IMU pose is obtained by
+// applying the calibrated lidar-to-IMU extrinsic:
+//
+//     T_world_imu = T_world_lidar * T_lidar_imu
+//
+// GTSAM preintegration assumes this inherited world frame has z pointing up
+// and gravity (0, 0, -g). This is physically consistent only when
+// laserMapping initializes a gravity-aligned world frame; otherwise the two
+// nodes share the same coordinates but the preintegrator's gravity convention
+// is inconsistent with them.
 #include "super_odometry/ImuPreintegration/imuPreintegration.h"
 
 
