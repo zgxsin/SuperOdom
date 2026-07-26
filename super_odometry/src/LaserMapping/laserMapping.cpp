@@ -353,13 +353,9 @@ void laserMapping::initializeFirstFrame(){
                                q_world_lidar_roll_pitch.x(),
                                q_world_lidar_roll_pitch.y(),
                                q_world_lidar_roll_pitch.z());
-        // The IMU attitude describes the IMU body; rotate it by the inverse
-        // IMU->lidar extrinsic so it describes the lidar body instead.
-        auto q_imu_lidar = Eigen::Quaterniond(R_imu_lidar);
-        q_imu_lidar.normalize();
-        q_world_lidar = q_imu_lidar.inverse() * q_world_lidar;
-        
-        
+        // Feature extraction already publishes the physical lidar attitude,
+        // q_world_lidar = q_world_imu * q_imu_lidar. Do not apply the
+        // extrinsic a second time here.
     }else{
 
         q_world_lidar=Eigen::Quaterniond(1,0,0,0); //If no IMU data, use identity rotation
