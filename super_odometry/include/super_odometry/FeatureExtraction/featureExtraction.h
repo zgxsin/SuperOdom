@@ -330,6 +330,7 @@ namespace super_odometry {
         // ---- Per-scan outputs ------------------------------------------------
         super_odometry_msgs::msg::LaserFeature laserFeature; // message assembled in publishTopic()
         std_msgs::msg::Header FeatureHeader;
+        // The world frame here is the same with the initial IMU frame.
         Eigen::Quaterniond q_world_lidar_start; // lidar attitude in world frame at scan start
         Eigen::Vector3d t_world_lidar_start;    // lidar position in world frame at scan start (zero for IMU-only)
         pcl::PointCloud<point_os::PointcloudXYZITR>::Ptr pointCloudwithTime=nullptr; // scratch cloud from assignTimeforPointCloud

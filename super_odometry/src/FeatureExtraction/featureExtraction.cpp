@@ -20,7 +20,7 @@
 // In parallel, imu_Handler runs at IMU rate (~200 Hz): it integrates the
 // gyro into a rolling orientation estimate q_world_imu for each sample (that is
 // what the deskewing interpolates between) and runs the one-time IMU
-// initialization that estimates biases, gravity, and the leveling rotation.
+// initialization that estimates sensor statistics, gravity, and initial tilt.
 // ============================================================================
 
 #include <super_odometry/FeatureExtraction/featureExtraction.h>
@@ -687,6 +687,10 @@ namespace super_odometry {
         measurement.gyr << msg->angular_velocity.x, 
                         msg->angular_velocity.y,
                         msg->angular_velocity.z;
+        // Raw IMUs commonly publish only acceleration and angular velocity; 
+        // orientation may be zero or identity.
+        // In this code, q_world_imu_driver is parsed but never used. updateImuOrientation() 
+        // instead integrates gyroscope readings, starting from identity. 
         measurement.q_world_imu_driver = Eigen::Quaterniond(
             msg->orientation.w, msg->orientation.x,
             msg->orientation.y, msg->orientation.z);
@@ -715,27 +719,18 @@ namespace super_odometry {
         Imu::Ptr imudata = std::make_shared<Imu>();
         imudata->time = measurement.timestamp;
         
-        // Livox-specific handling (only after IMU init has produced the
-        // leveling rotation and gravity estimate):
-        //  - rotate into the gravity-leveled lidar frame via
-        //    R_gravity_lidar_initial, matching the rotation applied to Livox
-        //    point clouds in livoxHandler;
-        //  - Livox IMUs report acceleration in units of g (a stationary
-        //    sensor reads ~1.0), so scale by gravity_norm / acc_mean.norm()
-        //    to get m/s^2.
+        // Livox reports acceleration in units of g (a stationary sensor reads
+        // ~1.0), so convert its magnitude to m/s^2 after initialization.
+        // Keep the vector in the physical IMU frame used by deskewing.
         if(IMU_INIT && config_.sensor == SensorType::LIVOX) {
             double gravity = imu_Init->gravity_norm;
-            Eigen::Vector3d gyr =
-                imu_Init->R_gravity_lidar_initial * measurement.gyr;
-            Eigen::Vector3d accel =
-                imu_Init->R_gravity_lidar_initial * measurement.accel;
-            imudata->acc = accel * gravity / imu_Init->acc_mean.norm();
+            imudata->acc =
+                measurement.accel * gravity / imu_Init->acc_mean.norm();
         } else {
             imudata->acc = measurement.accel;
         }
         
-        // Note the gyro is stored unrotated even for Livox (the rotated 'gyr'
-        // above is unused); orientation integration happens on raw gyro data.
+        // Gyro likewise remains in the physical IMU frame.
         imudata->gyr = measurement.gyr;
         return imudata;
     }
@@ -791,11 +786,9 @@ namespace super_odometry {
     // One-time IMU initialization trigger. Once lidar data has started
     // flowing and at least 1 second of IMU samples has accumulated, run
     // Imu::imuInit() on the buffered (assumed stationary) data. That routine
-    // estimates the gyro/accel biases, the gravity vector, and the constant
-    // initial gravity-to-lidar rotation R_gravity_lidar_initial =
-    // R_imu_gravity_initial.inverse() * R_imu_lidar, which re-expresses
-    // measurements in a gravity-leveled lidar frame. The buffer is cleared
-    // afterwards so deskewing starts from fresh samples.
+    // estimates the gyro/accel statistics, gravity vector, and initial tilt.
+    // Sensor measurements remain in their physical frames; the buffer is
+    // cleared afterwards so deskewing starts from fresh samples.
     void featureExtraction::imuInitialization(double timestamp) {
         double lidar_first_time = 0;
         if(lidarBuf.getFirstTime(lidar_first_time) && 
@@ -814,7 +807,7 @@ namespace super_odometry {
     }
 
     // IMU callback (~200 Hz): parse -> wrap into the internal Imu struct
-    // (with Livox leveling/rescaling) -> integrate gyro into q_world_imu ->
+    // (with Livox unit rescaling) -> integrate gyro into q_world_imu ->
     // buffer the sample for deskewing -> possibly run the one-time init.
     void featureExtraction::imu_Handler(const sensor_msgs::msg::Imu::SharedPtr msg_in) {
         m_buf.lock();
@@ -999,8 +992,8 @@ namespace super_odometry {
 
         manageLidarBuffer(pointCloud, laserCloudMsg->header.stamp.sec + laserCloudMsg->header.stamp.nanosec * 1e-9);
 
-        // Process only after the one-time IMU init has finished (so the
-        // leveling rotation and biases exist), or immediately in IMU-less
+        // Process only after the one-time IMU init has finished (so gravity
+        // scale and initial attitude are available), or immediately in IMU-less
         // mode. The processed scan is then removed from the buffer.
         if(IMU_INIT==true or imuBuf.empty())
         {   
@@ -1031,15 +1024,8 @@ namespace super_odometry {
         
         pointCloud->points.resize(msg->point_num);
 
-        // Unlike the Velodyne/Ouster path, Livox points are rotated by the
-        // gravity-leveling rotation right at ingestion, mirroring the same
-        // rotation applied to Livox IMU samples in createImuData(). Identity
-        // is used until the IMU initialization has produced the estimate.
-        Eigen::Matrix3d R_gravity_lidar_initial = Eigen::Matrix3d::Identity();
-        if (!imuBuf.empty()) {
-            R_gravity_lidar_initial = imu_Init->R_gravity_lidar_initial;
-        } 
-        
+        // Keep Livox points in the physical lidar frame, matching the
+        // Velodyne/Ouster paths and the T_imu_lidar deskew extrinsic.
         if(config_.provide_point_time) {     
             for (uint i=0; i < msg->point_num; i++) {
                 // Keep only points on configured scan lines whose tag bits
@@ -1047,12 +1033,9 @@ namespace super_odometry {
                 // (0x10); stronger noise classes are dropped.
                 if ((msg->points[i].line < config_.N_SCANS) &&
                     ((msg->points[i].tag & 0x30) == 0x10 || (msg->points[i].tag & 0x30) == 0x00)) {   
-                    Eigen::Vector3d point(msg->points[i].x, msg->points[i].y, msg->points[i].z);
-                    Eigen::Vector3d transformed_point =
-                        R_gravity_lidar_initial * point;
-                    pointCloud->points[i].x = transformed_point.x();
-                    pointCloud->points[i].y = transformed_point.y();
-                    pointCloud->points[i].z = transformed_point.z();
+                    pointCloud->points[i].x = msg->points[i].x;
+                    pointCloud->points[i].y = msg->points[i].y;
+                    pointCloud->points[i].z = msg->points[i].z;
                     pointCloud->points[i].intensity = msg->points[i].reflectivity;
                     // offset_time is nanoseconds since scan start; convert to
                     // the float seconds expected by the deskewing code.
