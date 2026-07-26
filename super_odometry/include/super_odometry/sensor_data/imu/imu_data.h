@@ -18,9 +18,9 @@
 //   - the gyroscope and accelerometer biases (the stationary means),
 //   - the initial roll/pitch tilt of the IMU w.r.t. gravity (yaw is not
 //     observable from an accelerometer, so it is fixed to 0), and
-//   - R_gravity_lidar_initial, the rotation later used by
-//     imuPreintegration::imuConverter() to re-express every IMU sample in a
-//     gravity-leveled lidar frame.
+//   - R_gravity_lidar_initial, a diagnostic description of the lidar's
+//     startup roll/pitch relative to gravity. Estimator measurements remain
+//     in their physical sensor frames.
 //
 // Frame conventions used below:
 //   - "world" is a gravity-aligned frame with z pointing up; only its
@@ -218,13 +218,10 @@ public:
 
     std::cout<<"R_imu_lidar: "<<R_imu_lidar<<std::endl;
     // R_imu_lidar maps lidar-frame vectors into the IMU frame. Composing it
-    // with the leveling rotation gives R_gravity_lidar_initial =
-    // R_imu_gravity_initial.inverse() * R_imu_lidar, which maps lidar-frame
-    // vectors into the initial gravity-aligned frame. The
-    // imuPreintegration node uses it to re-express IMU measurements in a
-    // gravity-leveled lidar frame. (All shipped calibrations set
-    // R_imu_lidar to identity, which masks a direction inconsistency in how
-    // imuConverter() applies this rotation; see imuConverter's docs.)
+    // with the leveling rotation gives the lidar's initial orientation in a
+    // gravity-aligned frame. This is retained for initialization diagnostics;
+    // preintegration and feature extraction keep measurements in physical
+    // IMU/lidar frames.
     R_gravity_lidar_initial=R_imu_gravity_initial.inverse()*R_imu_lidar;
     // The initial gravity-aligned frame is at the same origin as the IMU frame, but with the gravity direction aligned.
     // That's why the translation part is the same as the IMU frame.
@@ -288,8 +285,8 @@ public:
   Eigen::Vector3d gyr_cov; // per-axis variance of the gyroscope measurements
   Eigen::Quaterniond q_world_imu; // orientation from the IMU driver: R_world_imu
   Eigen::Matrix3d R_imu_gravity_initial; // maps gravity-aligned vectors into the initial IMU frame
-  Eigen::Matrix3d R_gravity_lidar_initial; // maps lidar-frame vectors into the initial gravity frame
-  Transformd T_gravity_lidar_initial; // maps lidar-frame points into the initial gravity frame
+  Eigen::Matrix3d R_gravity_lidar_initial; // diagnostic initial lidar orientation relative to gravity
+  Transformd T_gravity_lidar_initial; // diagnostic startup transform; not an estimator measurement frame
   double pitch_offset_gravity; // initial pitch w.r.t. gravity (rad), from calculatePitchRollMatrix()
   double roll_offset_gravity;  // initial roll w.r.t. gravity (rad)
 };

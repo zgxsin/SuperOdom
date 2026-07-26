@@ -197,7 +197,7 @@ namespace super_odometry {
         void laserCloudHandler(const sensor_msgs::msg::PointCloud2::SharedPtr laserCloudMsg);
 
         /// Callback for Livox CustomMsg scans: filters points by tag/line,
-        /// rotates them into the gravity-leveled frame, converts to the common
+        /// keeps them in the physical lidar frame, converts to the common
         /// format, and runs undistortion + feature extraction.
         void livoxHandler(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg);
 
@@ -253,8 +253,8 @@ namespace super_odometry {
         void updateImuOrientation(Imu::Ptr& imudata);
 
         /// One-time IMU initialization: after ~1 s of stationary data, runs
-        /// Imu::imuInit() to estimate gyro/accel biases, gravity, and the
-        /// initial gravity-to-lidar rotation R_gravity_lidar_initial used downstream.
+        /// Imu::imuInit() to estimate gyro/accel statistics, gravity, and the
+        /// initial sensor tilt used for diagnostics.
         void imuInitialization(double timestamp);
 
         /// Core undistortion routine (templated over the pose source: IMU

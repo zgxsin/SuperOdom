@@ -229,6 +229,28 @@ public:
     LocalMap() {
         // Start with the world origin mapped to the center cell of the grid,
         // so the map initially extends equally in all directions.
+        // World interval     World block
+        // [-75, -25)            -1
+        // [-25,  25)             0
+        // Initially:
+        // origin_ = (10, 10, 5);
+        // Therefore:
+        // World block 0  → local index 10
+        // World block 1  → local index 11
+
+        // Block index
+        // The block index identifies a slot in the fixed 21 × 21 × 11 array:
+        
+        // i: 0–20
+        // j: 0–20
+        // k: 0–10
+        // The relationship is:
+        
+        // world coordinate
+        //       ↓ divide into 50 m regions
+        // world block coordinate
+        //       ↓ add origin_
+        // local block index
         origin_ = Eigen::Vector3i(laserCloudWidth * 0.5, laserCloudHeight * 0.5, laserCloudDepth * 0.5);
     }
 
@@ -269,6 +291,7 @@ public:
             worldToBlockCoordinate(t_world_current.y()) + origin_.y();
         int centerCubeK =
             worldToBlockCoordinate(t_world_current.z()) + origin_.z();
+
 
         // Robot too close to the low-x face: shift every block one step in
         // +x. The slab at i = laserCloudWidth-1 is overwritten (dropped) and
