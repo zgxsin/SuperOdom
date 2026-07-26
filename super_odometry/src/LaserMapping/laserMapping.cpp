@@ -347,6 +347,7 @@ void laserMapping::initializeFirstFrame(){
     if(sensorMeas.q_world_lidar_prediction.w()!=0){   //Have IMU data
         //Extract roll and pitch, zero out yaw 
         tf2::Quaternion q_world_lidar_roll_pitch =
+        // The world in sensorMeas.q_world_lidar_prediction is the first IMU frame of initializaiton.
             utils::extractRollPitch(sensorMeas.q_world_lidar_prediction);
         q_world_lidar =
             Eigen::Quaterniond(q_world_lidar_roll_pitch.w(),
