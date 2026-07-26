@@ -43,9 +43,8 @@
 // Coordinate convention used everywhere below: a world point p falls in cell
 //   i = floor((p.x + 25) / 50) + origin_.x()   (same for j/k with y/z)
 // The +25 (half a block) centers cell boundaries so that cell (0,0,0) in
-// world-voxel coordinates covers [-25, 25) on each axis. The explicit
-// "if (p.x + 25 < 0) i--;" lines implement floor() for negative values,
-// because integer casting in C++ truncates toward zero.
+// world-voxel coordinates covers [-25, 25) on each axis. std::floor() gives
+// the same half-open intervals for both positive and negative coordinates.
 // ============================================================================
 
 #ifndef LOCALMAPOCTREE_H
@@ -217,6 +216,15 @@ public:
     static constexpr double voxelResulation = 50;
     static constexpr double halfVoxelResulation = voxelResulation * 0.5;
 
+    /// Converts one world coordinate to its 50 m block coordinate.
+    /// std::floor handles negative coordinates and exact negative boundaries
+    /// correctly, unlike integer truncation followed by an unconditional
+    /// decrement.
+    static int worldToBlockCoordinate(double coordinate) {
+        return static_cast<int>(std::floor(
+            (coordinate + halfVoxelResulation) / voxelResulation));
+    }
+
 public:
     LocalMap() {
         // Start with the world origin mapped to the center cell of the grid,
@@ -228,18 +236,10 @@ public:
     /// cell (0,0,0). Only used for (re)initialization; during normal
     /// operation shiftMap() moves the grid incrementally instead.
     Eigen::Vector3i setOrigin(const Eigen::Vector3d &t_world_current) {
-        // Which world-voxel does the robot occupy? (floor division; the
-        // decrements below fix truncation-toward-zero for negative coords)
-        int centerCubeI = int((t_world_current.x() + halfVoxelResulation) / voxelResulation);
-        int centerCubeJ = int((t_world_current.y() + halfVoxelResulation) / voxelResulation);
-        int centerCubeK = int((t_world_current.z() + halfVoxelResulation) / voxelResulation);
-
-        if(t_world_current.x() + halfVoxelResulation < 0)
-            centerCubeI--;
-        if(t_world_current.y() + halfVoxelResulation < 0)
-            centerCubeJ--;
-        if(t_world_current.z() + halfVoxelResulation < 0)
-            centerCubeK--;
+        // Which world block does the robot occupy?
+        int centerCubeI = worldToBlockCoordinate(t_world_current.x());
+        int centerCubeJ = worldToBlockCoordinate(t_world_current.y());
+        int centerCubeK = worldToBlockCoordinate(t_world_current.z());
 
         origin_.x() = -centerCubeI;
         origin_.y() = -centerCubeJ;
@@ -262,18 +262,13 @@ public:
     /// \return the robot's cell index (i,j,k) after shifting
     Eigen::Vector3i shiftMap(const Eigen::Vector3d &t_world_current) {
 
-        // Convert the world position to grid indices (floor division as in
-        // setOrigin).
-        int centerCubeI = int((t_world_current.x() + halfVoxelResulation) / voxelResulation) + origin_.x();
-        int centerCubeJ = int((t_world_current.y() + halfVoxelResulation) / voxelResulation) + origin_.y();
-        int centerCubeK = int((t_world_current.z() + halfVoxelResulation) / voxelResulation) + origin_.z();
-
-        if(t_world_current.x() + halfVoxelResulation < 0)
-            centerCubeI--;
-        if(t_world_current.y() + halfVoxelResulation < 0)
-            centerCubeJ--;
-        if(t_world_current.z() + halfVoxelResulation < 0)
-            centerCubeK--;
+        // Convert the world position to rolling-grid indices.
+        int centerCubeI =
+            worldToBlockCoordinate(t_world_current.x()) + origin_.x();
+        int centerCubeJ =
+            worldToBlockCoordinate(t_world_current.y()) + origin_.y();
+        int centerCubeK =
+            worldToBlockCoordinate(t_world_current.z()) + origin_.z();
 
         // Robot too close to the low-x face: shift every block one step in
         // +x. The slab at i = laserCloudWidth-1 is overwritten (dropped) and
@@ -440,16 +435,9 @@ public:
 
         // Locate the block containing the query (same floor-division
         // pattern as in shiftMap).
-        int cubeI = int((pt_query.x + halfVoxelResulation) / voxelResulation) + origin_.x();
-        int cubeJ = int((pt_query.y + halfVoxelResulation) / voxelResulation) + origin_.y();
-        int cubeK = int((pt_query.z + halfVoxelResulation) / voxelResulation) + origin_.z();
-
-        if(pt_query.x + halfVoxelResulation < 0)
-            cubeI--;
-        if(pt_query.y + halfVoxelResulation < 0)
-            cubeJ--;
-        if(pt_query.z + halfVoxelResulation < 0)
-            cubeK--;
+        int cubeI = worldToBlockCoordinate(pt_query.x) + origin_.x();
+        int cubeJ = worldToBlockCoordinate(pt_query.y) + origin_.y();
+        int cubeK = worldToBlockCoordinate(pt_query.z) + origin_.z();
 
         if(!(cubeI >= 0 && cubeI < laserCloudWidth && cubeJ >= 0 && cubeJ < laserCloudHeight && cubeK >= 0 &&
              cubeK < laserCloudDepth)) {
@@ -503,16 +491,9 @@ public:
                                          int num_nearest_search,
                                          float max_dist_inliner) const {
 
-        int cubeI = int((pt_query.x + halfVoxelResulation) / voxelResulation) + origin_.x();
-        int cubeJ = int((pt_query.y + halfVoxelResulation) / voxelResulation) + origin_.y();
-        int cubeK = int((pt_query.z + halfVoxelResulation) / voxelResulation) + origin_.z();
-
-        if(pt_query.x + halfVoxelResulation < 0)
-            cubeI--;
-        if(pt_query.y + halfVoxelResulation < 0)
-            cubeJ--;
-        if(pt_query.z + halfVoxelResulation < 0)
-            cubeK--;
+        int cubeI = worldToBlockCoordinate(pt_query.x) + origin_.x();
+        int cubeJ = worldToBlockCoordinate(pt_query.y) + origin_.y();
+        int cubeK = worldToBlockCoordinate(pt_query.z) + origin_.z();
 
         if(!(cubeI >= 0 && cubeI < laserCloudWidth && cubeJ >= 0 && cubeJ < laserCloudHeight && cubeK >= 0 &&
              cubeK < laserCloudDepth)) {
@@ -614,16 +595,9 @@ public:
 
         k_pts.clear();
 
-        int cubeI = int((pt_query.x + halfVoxelResulation) / voxelResulation) + origin_.x();
-        int cubeJ = int((pt_query.y + halfVoxelResulation) / voxelResulation) + origin_.y();
-        int cubeK = int((pt_query.z + halfVoxelResulation) / voxelResulation) + origin_.z();
-
-        if(pt_query.x + halfVoxelResulation < 0)
-            cubeI--;
-        if(pt_query.y + halfVoxelResulation < 0)
-            cubeJ--;
-        if(pt_query.z + halfVoxelResulation < 0)
-            cubeK--;
+        int cubeI = worldToBlockCoordinate(pt_query.x) + origin_.x();
+        int cubeJ = worldToBlockCoordinate(pt_query.y) + origin_.y();
+        int cubeK = worldToBlockCoordinate(pt_query.z) + origin_.z();
 
         if(!(cubeI >= 0 && cubeI < laserCloudWidth && cubeJ >= 0 && cubeJ < laserCloudHeight && cubeK >= 0 &&
              cubeK < laserCloudDepth)) {
@@ -668,16 +642,9 @@ public:
         // were touched, so only those get re-filtered and re-indexed.
         std::set<int> blockInd;
         for(const auto &point : laserCloudEdgeStack) {
-            int cubeI = int((point.x + halfVoxelResulation) / voxelResulation) + origin_.x();
-            int cubeJ = int((point.y + halfVoxelResulation) / voxelResulation) + origin_.y();
-            int cubeK = int((point.z + halfVoxelResulation) / voxelResulation) + origin_.z();
-
-            if(point.x + halfVoxelResulation < 0)
-                cubeI--;
-            if(point.y + halfVoxelResulation < 0)
-                cubeJ--;
-            if(point.z + halfVoxelResulation < 0)
-                cubeK--;
+            int cubeI = worldToBlockCoordinate(point.x) + origin_.x();
+            int cubeJ = worldToBlockCoordinate(point.y) + origin_.y();
+            int cubeK = worldToBlockCoordinate(point.z) + origin_.z();
 
             if(cubeI >= 0 && cubeI < laserCloudWidth && cubeJ >= 0 && cubeJ < laserCloudHeight && cubeK >= 0 &&
                cubeK < laserCloudDepth) {
@@ -734,16 +701,9 @@ public:
         std::set<int> blockInd;
         for(const auto &point : laserCloudSurfStack) {
 
-            int cubeI = int((point.x + halfVoxelResulation) / voxelResulation) + origin_.x();
-            int cubeJ = int((point.y + halfVoxelResulation) / voxelResulation) + origin_.y();
-            int cubeK = int((point.z + halfVoxelResulation) / voxelResulation) + origin_.z();
-
-            if(point.x + halfVoxelResulation < 0)
-                cubeI--;
-            if(point.y + halfVoxelResulation < 0)
-                cubeJ--;
-            if(point.z + halfVoxelResulation < 0)
-                cubeK--;
+            int cubeI = worldToBlockCoordinate(point.x) + origin_.x();
+            int cubeJ = worldToBlockCoordinate(point.y) + origin_.y();
+            int cubeK = worldToBlockCoordinate(point.z) + origin_.z();
 
             if(cubeI >= 0 && cubeI < laserCloudWidth && cubeJ >= 0 && cubeJ < laserCloudHeight && cubeK >= 0 &&
                cubeK < laserCloudDepth) {
