@@ -337,17 +337,17 @@ void laserMapping::setInitialGuess()
   selectPosePrediction();
 }
 
-// First scan ever: there is no map yet, so this pose DEFINES the world
-// frame. Using the IMU's roll/pitch (with yaw zeroed, since a gyro cannot
-// observe heading) makes the world frame gravity-aligned: z points up and
-// the ground plane in the map is horizontal.
+// First scan ever: there is no map yet, so this pose DEFINES the world frame.
+// Feature extraction has already leveled the incoming lidar attitude using
+// the stationary accelerometer estimate. Keep that gravity-referenced roll
+// and pitch, but zero yaw because gravity cannot observe heading. The result
+// is a z-up world frame with an arbitrary zero heading.
 void laserMapping::initializeFirstFrame(){
 
     //Get initial orientation from IMU prediction 
     if(sensorMeas.q_world_lidar_prediction.w()!=0){   //Have IMU data
-        //Extract roll and pitch, zero out yaw 
+        // Extract gravity-referenced roll and pitch and zero the unobservable yaw.
         tf2::Quaternion q_world_lidar_roll_pitch =
-        // The world in sensorMeas.q_world_lidar_prediction is the first IMU frame of initializaiton.
             utils::extractRollPitch(sensorMeas.q_world_lidar_prediction);
         q_world_lidar =
             Eigen::Quaterniond(q_world_lidar_roll_pitch.w(),

@@ -735,12 +735,12 @@ namespace super_odometry {
         return imudata;
     }
 
-    // Maintains the rolling orientation estimate q_world_imu (attitude of the IMU
-    // body in a fixed "world" frame) that the deskewing interpolates between.
-    // This is pure gyro dead reckoning: each new sample rotates the previous
-    // attitude by the angle swept since the last sample. It drifts slowly,
-    // but only pose DIFFERENCES within a 0.1 s scan matter for deskewing,
-    // so the drift cancels out.
+    // Maintains the rolling orientation estimate q_world_imu (attitude of the
+    // IMU body in a gravity-aligned frame) that deskewing interpolates between.
+    // After stationary initialization, the first fresh sample is seeded with
+    // the accelerometer-derived leveling rotation. Later samples are pure gyro
+    // dead reckoning. This can drift over time, but only pose differences
+    // within a scan matter for deskewing.
     void featureExtraction::updateImuOrientation(Imu::Ptr& imudata) {
         if (!imuBuf.empty()) {
             const auto& last_imu = imuBuf.measMap_.rbegin()->second;
@@ -756,30 +756,15 @@ namespace super_odometry {
             imudata->q_world_imu =
                 last_imu->q_world_imu * q_imu_prev_imu_current;
             imudata->q_world_imu.normalize();
-        } else if (config_.use_imu_roll_pitch) {
-            // Very first sample: intended to seed the attitude with the
-            // sensor's roll/pitch while removing yaw (pre-multiplying by a
-            // -yaw rotation), so the world frame starts gravity-aligned with
-            // zero heading. Note that createImuData() never copies the driver
-            // orientation into q_world_imu, so it is still identity here and
-            // this branch is effectively a no-op; integration simply starts
-            // from identity.
-            tf2::Quaternion q_world_imu_current(
-                imudata->q_world_imu.x(), imudata->q_world_imu.y(),
-                imudata->q_world_imu.z(), imudata->q_world_imu.w());
-            double roll, pitch, yaw;
-            tf2::Matrix3x3(q_world_imu_current).getRPY(roll, pitch, yaw);
-            
-            tf2::Quaternion q_world_yaw_correction;
-            q_world_yaw_correction.setRPY(0, 0, -yaw);
-            tf2::Quaternion q_world_imu_initial =
-                q_world_yaw_correction * q_world_imu_current;
-            
+        } else if (IMU_INIT) {
+            // R_imu_gravity_initial maps gravity-frame vectors into the
+            // initial physical IMU frame. Its inverse is therefore the
+            // yaw-free initial attitude R_gravity_imu. imuInitialization()
+            // clears the old buffer, so this branch seeds the first sample
+            // used by deskewing and laserMapping after initialization.
             imudata->q_world_imu =
-                Eigen::Quaterniond(q_world_imu_initial.w(),
-                                   q_world_imu_initial.x(),
-                                   q_world_imu_initial.y(),
-                                   q_world_imu_initial.z());
+                Eigen::Quaterniond(imu_Init->R_imu_gravity_initial.inverse());
+            imudata->q_world_imu.normalize();
         }
     }
 

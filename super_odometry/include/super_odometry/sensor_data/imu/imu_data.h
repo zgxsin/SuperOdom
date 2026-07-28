@@ -18,9 +18,10 @@
 //   - the gyroscope and accelerometer biases (the stationary means),
 //   - the initial roll/pitch tilt of the IMU w.r.t. gravity (yaw is not
 //     observable from an accelerometer, so it is fixed to 0), and
-//   - R_gravity_lidar_initial, a diagnostic description of the lidar's
-//     startup roll/pitch relative to gravity. Estimator measurements remain
-//     in their physical sensor frames.
+//   - R_gravity_lidar_initial, the lidar's startup roll/pitch relative to
+//     gravity. Feature extraction uses the corresponding IMU leveling
+//     rotation to initialize its attitude; raw measurements remain in their
+//     physical sensor frames.
 //
 // Frame conventions used below:
 //   - "world" is a gravity-aligned frame with z pointing up; only its
@@ -219,8 +220,8 @@ public:
     std::cout<<"R_imu_lidar: "<<R_imu_lidar<<std::endl;
     // R_imu_lidar maps lidar-frame vectors into the IMU frame. Composing it
     // with the leveling rotation gives the lidar's initial orientation in a
-    // gravity-aligned frame. This is retained for initialization diagnostics;
-    // preintegration and feature extraction keep measurements in physical
+    // gravity-aligned frame. Feature extraction uses the IMU leveling rotation
+    // to initialize q_world_imu; measurements themselves remain in physical
     // IMU/lidar frames.
     R_gravity_lidar_initial=R_imu_gravity_initial.inverse()*R_imu_lidar;
     // The initial gravity-aligned frame is at the same origin as the IMU frame, but with the gravity direction aligned.
